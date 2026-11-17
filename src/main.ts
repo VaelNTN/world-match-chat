@@ -19,8 +19,9 @@ let profile: UserProfile = loadProfile();
 let sessionState: SessionState = {
   phase: 'idle',
   searchStatus: '',
+  serverConfigured: Boolean(getApiUrl()),
+  waitingOnlineCount: null,
   partner: null,
-  partnerTyping: false,
   messages: [],
 };
 
@@ -52,7 +53,6 @@ function render(): void {
     lastPhaseRendered = 'searching';
     renderSearching();
   } else {
-    // Keep input value intact when only updating messages inside connected phase!
     const existingInput = document.getElementById('chat-input') as HTMLInputElement | null;
     const draft = existingInput ? existingInput.value : '';
     const hadFocus = existingInput !== null && document.activeElement === existingInput;
@@ -65,15 +65,16 @@ function render(): void {
 function renderSetup(): void {
   const targetText =
     profile.gender === 'man'
-      ? 'Je wordt gekoppeld met een Vrouw ♀️ wereldwijd'
-      : 'Je wordt gekoppeld met een Man ♂️ wereldwijd';
+      ? 'Je wordt gekoppeld met een echte Vrouw ♀️ wereldwijd'
+      : 'Je wordt gekoppeld met een echte Man ♂️ wereldwijd';
+  const hasServer = Boolean(getApiUrl());
 
   app.innerHTML = `
     <div class="app-shell">
       <div class="topbar">
         <div class="brand">
           <h1>🌍 WorldMatch Chat</h1>
-          <span>18+ Wereldwijde 1-op-1 Chat</span>
+          <span>18+ Wereldwijde 1-op-1 Chat • ${hasServer ? '🟢 Server verbonden' : '🟠 Server nog niet ingesteld'}</span>
         </div>
         <div class="top-actions">
           <button class="icon-btn" id="btn-mute">${chatSound.isMuted() ? '🔇' : '🔊'}</button>
@@ -83,6 +84,16 @@ function renderSetup(): void {
       </div>
 
       <div class="main-scroll">
+        ${
+          !hasServer
+            ? `<div class="card" style="border-color:rgba(245,158,11,0.55);background:rgba(120,53,15,0.28);">
+                <div style="font-size:0.82rem;line-height:1.38;">
+                  ⚠️ <strong>Live server nog niet gekoppeld:</strong> Er worden nooit nep-bots gekoppeld. Zodra je Stap 2 uit <code>RELEASE_STEP_BY_STEP.txt</code> hebt afgerond en je Worker URL invult bij ⚙️ Instellingen, chat je wereldwijd met echte gebruikers!
+                </div>
+              </div>`
+            : ''
+        }
+
         <div class="card">
           <div class="section-label">
             <span>1. Wie ben jij?</span>
@@ -133,7 +144,7 @@ function renderSetup(): void {
           <div class="toggle-row">
             <div>
               <strong>🌍 Wereldwijde match-uitbreiding</strong>
-              <div style="font-size:0.73rem;color:#94a3b8;">Als jouw taal even rustig is, match je wereldwijd zodat je bijna altijd direct iemand vindt.</div>
+              <div style="font-size:0.73rem;color:#94a3b8;">Als jouw taal rustig is, verruim je na 4s naar alle andere talen wereldwijd.</div>
             </div>
             <button class="icon-btn" id="btn-global-toggle" style="min-width:64px;${
               profile.allowGlobalFallback ? 'border-color:#22c55e;color:#4ade80;' : ''
@@ -143,7 +154,7 @@ function renderSetup(): void {
           </div>
         </div>
 
-        <button class="primary-cta" id="btn-find-match">🔍 ZOEK WERELDWIJDE MATCH</button>
+        <button class="primary-cta" id="btn-find-match">🔍 ZOEK ECHTE WERELDWIJDE MATCH</button>
       </div>
     </div>
   `;
@@ -219,12 +230,13 @@ function renderSetup(): void {
 
 function renderSearching(): void {
   const targetIcon = profile.gender === 'man' ? '👩' : '👨';
+  const targetWord = profile.gender === 'man' ? 'vrouwen' : 'mannen';
   app.innerHTML = `
     <div class="app-shell">
       <div class="topbar">
         <div class="brand">
           <h1>🌍 WorldMatch Chat</h1>
-          <span>Matchmaker actief</span>
+          <span>Live Matchmaker (geen bots)</span>
         </div>
         <button class="icon-btn" id="btn-cancel-search">Annuleren</button>
       </div>
@@ -232,13 +244,23 @@ function renderSearching(): void {
       <div class="main-scroll">
         <div class="search-box">
           <div class="radar-pulse">${targetIcon}</div>
-          <h2 style="margin:0;font-size:1.25rem;">${esc(sessionState.searchStatus)}</h2>
-          <p style="margin:0;font-size:0.84rem;color:#94a3b8;max-width:300px;">
+          <h2 style="margin:0;font-size:1.18rem;max-width:340px;">${esc(sessionState.searchStatus)}</h2>
+          ${
+            sessionState.waitingOnlineCount !== null
+              ? `<div style="font-size:0.84rem;color:#38bdf8;font-weight:700;">Online ${targetWord} in wachtrij: ${sessionState.waitingOnlineCount}</div>`
+              : ''
+          }
+          <p style="margin:0;font-size:0.82rem;color:#94a3b8;max-width:300px;">
             Gekozen talen: ${profile.languages.slice(0, 6).map((l) => getLangLabel(l)).join(', ')}${
               profile.languages.length > 6 ? ` +${profile.languages.length - 6}` : ''
             }
           </p>
-          <button class="icon-btn" id="btn-stop-search" style="padding:10px 18px;margin-top:8px;">← Terug naar keuzes</button>
+          ${
+            !sessionState.serverConfigured
+              ? `<button class="icon-btn" id="btn-open-cfg-from-search" style="border-color:#38bdf8;color:#bae6fd;padding:10px 16px;">⚙️ Server URL instellen</button>`
+              : ''
+          }
+          <button class="icon-btn" id="btn-stop-search" style="padding:10px 18px;margin-top:4px;">← Terug naar keuzes</button>
         </div>
       </div>
     </div>
@@ -246,6 +268,8 @@ function renderSearching(): void {
 
   document.getElementById('btn-cancel-search')!.onclick = () => session.leave(false);
   document.getElementById('btn-stop-search')!.onclick = () => session.leave(false);
+  const cfgBtn = document.getElementById('btn-open-cfg-from-search');
+  if (cfgBtn) cfgBtn.onclick = () => openSettingsModal();
 }
 
 function renderChat(draftText: string, restoreFocus: boolean): void {
@@ -294,13 +318,6 @@ function renderChat(draftText: string, restoreFocus: boolean): void {
               `;
             })
             .join('')}
-          ${
-            sessionState.partnerTyping
-              ? `<div class="msg-row partner"><div class="msg-bubble" style="color:#94a3b8;font-style:italic;">${esc(
-                  p.nickname
-                )} is aan het typen...</div></div>`
-              : ''
-          }
         </div>
 
         <div class="icebreakers">
@@ -363,7 +380,7 @@ function openHistoryModal(): void {
       </div>
       ${
         history.length === 0
-          ? `<p style="color:#94a3b8;font-size:0.86rem;">Nog geen chats gestart. Zoek een wereldwijde match!</p>`
+          ? `<p style="color:#94a3b8;font-size:0.86rem;">Nog geen echte chats gevoerd.</p>`
           : history
               .map(
                 (h) => `
@@ -396,7 +413,7 @@ function openSettingsModal(): void {
         <button class="icon-btn" id="close-set">✕</button>
       </div>
       <p style="font-size:0.8rem;color:#94a3b8;margin-top:0;">
-        Stel optioneel jouw Cloudflare Worker URL in voor live matches tussen verschillende telefoons wereldwijd.
+        Vul jouw live Cloudflare Worker URL in (zie <code>RELEASE_STEP_BY_STEP.txt</code>) om gebruikers wereldwijd live aan elkaar te koppelen.
       </p>
       <input class="text-input" id="api-url-inp" value="${esc(getApiUrl())}" placeholder="https://arcade-highscores-worker...workers.dev" style="margin-bottom:12px;" />
       <button class="primary-cta" id="save-set" style="padding:11px;">Opslaan</button>
@@ -408,6 +425,11 @@ function openSettingsModal(): void {
     const val = (modal.querySelector('#api-url-inp') as HTMLInputElement).value;
     setApiUrl(val);
     modal.remove();
+    if (sessionState.phase === 'searching') {
+      session.startSearch();
+    } else {
+      render();
+    }
   };
 }
 

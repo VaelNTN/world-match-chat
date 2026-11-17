@@ -1,9 +1,4 @@
-import {
-  buildGreeting,
-  generateContextualReply,
-  getCountry,
-  pickFallbackPartner,
-} from '../chat/chatCatalog';
+import { getCountry } from '../chat/chatCatalog';
 import {
   ChatMessage,
   Gender,
@@ -134,8 +129,9 @@ function recordMatchHistory(partner: MatchPartner, lastMessage: string): void {
 export interface SessionState {
   phase: SessionPhase;
   searchStatus: string;
+  serverConfigured: boolean;
+  waitingOnlineCount: number | null;
   partner: MatchPartner | null;
-  partnerTyping: boolean;
   messages: ChatMessage[];
 }
 
@@ -145,17 +141,15 @@ export class WorldChatSession {
 
   private phase: SessionPhase = 'idle';
   private searchStatus = '';
+  private waitingOnlineCount: number | null = null;
   private partner: MatchPartner | null = null;
-  private partnerTyping = false;
   private messages: ChatMessage[] = [];
 
   private roomId: string | null = null;
   private lastPollSince = 0;
+  private searchStartedAt = 0;
   private pollTimer: number | null = null;
-  private fallbackTimer: number | null = null;
-  private replyTimer: number | null = null;
   private bc: BroadcastChannel | null = null;
-  private recentFallbackNames: string[] = [];
 
   constructor(profile: UserProfile, onChange: (state: SessionState) => void) {
     this.profile = profile;
@@ -170,8 +164,9 @@ export class WorldChatSession {
     return {
       phase: this.phase,
       searchStatus: this.searchStatus,
+      serverConfigured: Boolean(getApiUrl()),
+      waitingOnlineCount: this.waitingOnlineCount,
       partner: this.partner,
-      partnerTyping: this.partnerTyping,
       messages: [...this.messages],
     };
   }
@@ -185,14 +180,6 @@ export class WorldChatSession {
       clearInterval(this.pollTimer);
       this.pollTimer = null;
     }
-    if (this.fallbackTimer !== null) {
-      clearTimeout(this.fallbackTimer);
-      this.fallbackTimer = null;
-    }
-    if (this.replyTimer !== null) {
-      clearTimeout(this.replyTimer);
-      this.replyTimer = null;
-    }
     if (this.bc) {
       this.bc.close();
       this.bc = null;
@@ -203,15 +190,19 @@ export class WorldChatSession {
     this.leave(false);
     const targetGender: Gender = this.profile.gender === 'man' ? 'vrouw' : 'man';
     const targetLabel = targetGender === 'vrouw' ? 'Vrouw ♀️' : 'Man ♂️';
+    const api = getApiUrl();
 
     this.phase = 'searching';
     this.partner = null;
-    this.partnerTyping = false;
     this.messages = [];
-    this.searchStatus = `Wereldwijd zoeken naar een ${targetLabel} in jouw talen...`;
+    this.waitingOnlineCount = null;
+    this.searchStartedAt = Date.now();
+    this.searchStatus = api
+      ? `Zoeken naar een echte ${targetLabel} in jouw gekozen talen...`
+      : `Geen live server URL ingesteld! Stel jouw Backend URL in bij ⚙️ Instellingen (zie RELEASE_STEP_BY_STEP.txt).`;
     this.emit();
 
-    // 1. Setup BroadcastChannel so 2 tabs/browsers on the same device can match live instantly
+    // BroadcastChannel allows 2 real tabs on the same device to test live 1-on-1 without fake bots
     if (typeof BroadcastChannel !== 'undefined') {
       this.bc = new BroadcastChannel('world-match-chat-lobby');
       this.bc.onmessage = (ev: MessageEvent<{
@@ -226,6 +217,8 @@ export class WorldChatSession {
         if (d.type === 'SEEK' && this.phase === 'searching' && d.from) {
           if (d.from.deviceId === this.profile.deviceId) return;
           if (d.from.gender !== targetGender) return;
+          const blocked = loadBlockedIds();
+          if (blocked.includes(d.from.deviceId)) return;
           const hasSharedLang = d.from.languages.some((l) => this.profile.languages.includes(l));
           if (!hasSharedLang && !this.profile.allowGlobalFallback) return;
 
@@ -246,7 +239,7 @@ export class WorldChatSession {
               countryFlag: c.flag,
               languages: d.from.languages,
               isRemoteHuman: true,
-              bio: `Live gebruiker uit ${c.name}`,
+              bio: `Live uit ${c.name}`,
             },
             room
           );
@@ -267,14 +260,12 @@ export class WorldChatSession {
               countryFlag: c.flag,
               languages: d.from.languages,
               isRemoteHuman: true,
-              bio: `Live gebruiker uit ${c.name}`,
+              bio: `Live uit ${c.name}`,
             },
             d.roomId
           );
         } else if (d.type === 'MSG' && d.roomId === this.roomId && d.message) {
-          if (d.message.senderName === this.profile.nickname && d.from?.deviceId === this.profile.deviceId) {
-            return;
-          }
+          if (d.from?.deviceId === this.profile.deviceId) return;
           this.messages.push({
             ...d.message,
             sender: 'partner',
@@ -287,7 +278,7 @@ export class WorldChatSession {
             id: `sys-${Date.now()}`,
             sender: 'system',
             senderName: 'Systeem',
-            text: `${this.partner?.nickname || 'De ander'} heeft de chat verlaten. Tik op "Volgende" voor een nieuwe wereldwijde match!`,
+            text: `${this.partner?.nickname || 'De ander'} heeft de chat verlaten. Tik op "Volgende" voor een nieuwe echte match!`,
             createdAt: Date.now(),
           });
           this.emit();
@@ -297,44 +288,22 @@ export class WorldChatSession {
       this.bc.postMessage({ type: 'SEEK', from: this.profile });
     }
 
-    // 2. Worker queue polling if Worker URL configured
-    const api = getApiUrl();
+    // Real Worker queue matchmaking (NO bots ever!)
     if (api) {
       void this.tryWorkerMatch(false);
       this.pollTimer = window.setInterval(() => {
         if (this.phase === 'searching') {
-          void this.tryWorkerMatch(true);
-        } else if (this.phase === 'connected' && this.roomId && !this.roomId.startsWith('bc-') && !this.roomId.startsWith('sim-')) {
+          const waitedMs = Date.now() - this.searchStartedAt;
+          const allowGlobal = waitedMs >= 4000 && this.profile.allowGlobalFallback;
+          if (allowGlobal) {
+            this.searchStatus = `Wachten op een echte ${targetLabel} wereldwijd (alle talen)...`;
+          }
+          void this.tryWorkerMatch(allowGlobal);
+        } else if (this.phase === 'connected' && this.roomId && !this.roomId.startsWith('bc-')) {
           void this.pollWorkerRoom();
         }
-      }, 1400);
+      }, 1500);
     }
-
-    // 3. After 2.6s (if still searching), broaden globally and match available global partner so user always finds someone!
-    this.fallbackTimer = window.setTimeout(() => {
-      if (this.phase !== 'searching') return;
-      this.searchStatus = `Talen verruimen naar wereldwijd (${targetLabel})...`;
-      this.emit();
-
-      this.fallbackTimer = window.setTimeout(() => {
-        if (this.phase !== 'searching') return;
-        const partner = pickFallbackPartner(
-          targetGender,
-          this.profile.languages,
-          this.profile.allowGlobalFallback,
-          this.recentFallbackNames
-        );
-        if (!partner) {
-          this.searchStatus =
-            'Geen match gevonden met alleen deze taal. Zet "Wereldwijd alle talen" aan om direct iemand te vinden!';
-          this.emit();
-          return;
-        }
-        this.recentFallbackNames.push(partner.nickname);
-        if (this.recentFallbackNames.length > 8) this.recentFallbackNames.shift();
-        this.connectToPartner(partner, `sim-${Date.now().toString(36)}`);
-      }, 1100);
-    }, 1700);
   }
 
   private async tryWorkerMatch(allowGlobal: boolean): Promise<void> {
@@ -355,19 +324,30 @@ export class WorldChatSession {
           allowGlobal: allowGlobal && this.profile.allowGlobalFallback,
         }),
       });
-      if (!res.ok) return;
+      if (!res.ok) {
+        this.searchStatus = `Server gaf fout (${res.status}). Controleer of de Cloudflare Worker + D1 gedeployed is.`;
+        this.emit();
+        return;
+      }
       const data = (await res.json()) as {
         matched?: boolean;
+        waitingCount?: number;
         roomId?: string;
         partner?: MatchPartner;
       };
+      if (typeof data.waitingCount === 'number') {
+        this.waitingOnlineCount = data.waitingCount;
+        this.emit();
+      }
       if (data.matched && data.roomId && data.partner && this.phase === 'searching') {
         const blocked = loadBlockedIds();
         if (blocked.includes(data.partner.id)) return;
         this.connectToPartner({ ...data.partner, isRemoteHuman: true }, data.roomId);
       }
     } catch {
-      // network silent; fallback covers user
+      this.searchStatus =
+        'Kan de match-server niet bereiken. Controleer je internet of Backend URL in ⚙️ Instellingen.';
+      this.emit();
     }
   }
 
@@ -414,26 +394,21 @@ export class WorldChatSession {
           id: `sys-${Date.now()}`,
           sender: 'system',
           senderName: 'Systeem',
-          text: `${this.partner?.nickname || 'De ander'} is weggegaan. Druk op Volgende ⏭️!`,
+          text: `${this.partner?.nickname || 'De ander'} heeft de chat verlaten. Druk op Volgende ⏭️!`,
           createdAt: Date.now(),
         });
         this.leave(true);
       }
     } catch {
-      // ignore
+      // ignore transient network glitches
     }
   }
 
   private connectToPartner(partner: MatchPartner, roomId: string): void {
-    if (this.fallbackTimer !== null) {
-      clearTimeout(this.fallbackTimer);
-      this.fallbackTimer = null;
-    }
     this.phase = 'connected';
     this.partner = partner;
     this.roomId = roomId;
     this.lastPollSince = 0;
-    this.partnerTyping = false;
 
     const genderTxt = partner.gender === 'vrouw' ? 'Vrouw ♀️' : 'Man ♂️';
     this.messages = [
@@ -441,35 +416,13 @@ export class WorldChatSession {
         id: `sys-connect-${Date.now()}`,
         sender: 'system',
         senderName: 'Match',
-        text: `Gematcht met ${partner.nickname} (${genderTxt}) uit ${partner.countryFlag} ${partner.countryName}!`,
+        text: `Live gekoppeld met ${partner.nickname} (${genderTxt}) uit ${partner.countryFlag} ${partner.countryName}!`,
         createdAt: Date.now(),
       },
     ];
     chatSound.matched();
-    recordMatchHistory(partner, 'Gematcht!');
+    recordMatchHistory(partner, 'Gekoppeld!');
     this.emit();
-
-    // If simulated global partner, send warm multilingual greeting after typing delay
-    if (!partner.isRemoteHuman) {
-      this.partnerTyping = true;
-      this.emit();
-      this.replyTimer = window.setTimeout(() => {
-        if (this.phase !== 'connected' || !this.partner) return;
-        this.partnerTyping = false;
-        const g = buildGreeting(this.partner, this.profile.languages);
-        this.messages.push({
-          id: `p-${Date.now()}`,
-          sender: 'partner',
-          senderName: this.partner.nickname,
-          text: g.text,
-          lang: g.lang,
-          createdAt: Date.now(),
-        });
-        chatSound.incoming();
-        recordMatchHistory(this.partner, g.text);
-        this.emit();
-      }, 950);
-    }
   }
 
   sendMessage(rawText: string): void {
@@ -496,7 +449,7 @@ export class WorldChatSession {
         from: this.profile,
         message: msg,
       });
-    } else if (this.roomId && !this.roomId.startsWith('sim-')) {
+    } else if (this.roomId) {
       const api = getApiUrl();
       if (api) {
         void fetch(`${api}/api/world-chat/send`, {
@@ -511,33 +464,6 @@ export class WorldChatSession {
           }),
         }).catch(() => {});
       }
-    } else if (!this.partner.isRemoteHuman) {
-      if (this.replyTimer !== null) clearTimeout(this.replyTimer);
-      this.partnerTyping = true;
-      this.emit();
-      const delay = 750 + Math.min(1300, text.length * 22);
-      const userCountry = getCountry(this.profile.countryCode).name;
-      this.replyTimer = window.setTimeout(() => {
-        if (this.phase !== 'connected' || !this.partner) return;
-        this.partnerTyping = false;
-        const reply = generateContextualReply(
-          this.partner,
-          text,
-          userCountry,
-          this.profile.languages
-        );
-        this.messages.push({
-          id: `p-${Date.now()}`,
-          sender: 'partner',
-          senderName: this.partner.nickname,
-          text: reply.text,
-          lang: reply.lang,
-          createdAt: Date.now(),
-        });
-        chatSound.incoming();
-        recordMatchHistory(this.partner, reply.text);
-        this.emit();
-      }, delay);
     }
   }
 
@@ -547,7 +473,7 @@ export class WorldChatSession {
       this.bc.postMessage({ type: 'LEAVE', roomId: oldRoom, from: this.profile });
     }
     const api = getApiUrl();
-    if (api && oldRoom && !oldRoom.startsWith('bc-') && !oldRoom.startsWith('sim-')) {
+    if (api) {
       void fetch(`${api}/api/world-chat/leave`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -560,7 +486,6 @@ export class WorldChatSession {
 
     this.clearTimers();
     this.roomId = null;
-    this.partnerTyping = false;
     this.phase = 'idle';
     if (!keepMessages) {
       this.partner = null;
