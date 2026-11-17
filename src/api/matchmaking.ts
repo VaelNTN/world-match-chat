@@ -13,6 +13,14 @@ const KEY_PROFILE = 'wm_profile_v1';
 const KEY_API = 'wm_api_url_v1';
 const KEY_HISTORY = 'wm_match_history_v1';
 const KEY_BLOCKED = 'wm_blocked_ids_v1';
+const KEY_BLOCKED_META = 'wm_blocked_meta_v1';
+
+export interface BlockedUserEntry {
+  id: string;
+  nickname: string;
+  countryFlag: string;
+  blockedAt: number;
+}
 
 function createDeviceId(): string {
   return `wm-${Math.random().toString(36).slice(2, 10)}-${Date.now().toString(36)}`;
@@ -31,7 +39,7 @@ export function loadProfile(): UserProfile {
         languages:
           Array.isArray(parsed.languages) && parsed.languages.length > 0
             ? parsed.languages
-            : ['nl', 'en'],
+            : ['en', 'nl'],
         allowGlobalFallback: parsed.allowGlobalFallback !== false,
       };
     }
@@ -43,7 +51,7 @@ export function loadProfile(): UserProfile {
     nickname: 'Globetrotter',
     gender: 'man',
     countryCode: 'NL',
-    languages: ['nl', 'en'],
+    languages: ['en', 'nl'],
     allowGlobalFallback: true,
   };
   saveProfile(fresh);
@@ -72,7 +80,12 @@ export function getApiUrl(): string {
 
 export function setApiUrl(url: string): void {
   try {
-    localStorage.setItem(KEY_API, url.trim().replace(/\/+$/, ''));
+    const clean = url.trim().replace(/\/+$/, '');
+    if (!clean) {
+      localStorage.removeItem(KEY_API);
+    } else {
+      localStorage.setItem(KEY_API, clean);
+    }
   } catch {
     // ignore
   }
@@ -87,7 +100,30 @@ export function loadBlockedIds(): string[] {
   }
 }
 
-export function blockPartnerId(id: string): void {
+function loadBlockedMetaMap(): Record<string, Omit<BlockedUserEntry, 'id'>> {
+  try {
+    const raw = localStorage.getItem(KEY_BLOCKED_META);
+    return raw ? (JSON.parse(raw) as Record<string, Omit<BlockedUserEntry, 'id'>>) : {};
+  } catch {
+    return {};
+  }
+}
+
+export function loadBlockedUsers(): BlockedUserEntry[] {
+  const ids = loadBlockedIds();
+  const meta = loadBlockedMetaMap();
+  return ids.map((id) => ({
+    id,
+    nickname: meta[id]?.nickname || `User ${id.slice(-4)}`,
+    countryFlag: meta[id]?.countryFlag || '🌍',
+    blockedAt: meta[id]?.blockedAt || 0,
+  }));
+}
+
+export function blockPartnerId(
+  id: string,
+  meta?: { nickname: string; countryFlag: string }
+): void {
   const list = loadBlockedIds();
   if (!list.includes(id)) {
     list.push(id);
@@ -97,6 +133,40 @@ export function blockPartnerId(id: string): void {
       // ignore
     }
   }
+  if (meta) {
+    const map = loadBlockedMetaMap();
+    map[id] = {
+      nickname: meta.nickname,
+      countryFlag: meta.countryFlag,
+      blockedAt: Date.now(),
+    };
+    try {
+      localStorage.setItem(KEY_BLOCKED_META, JSON.stringify(map));
+    } catch {
+      // ignore
+    }
+  }
+}
+
+export function unblockPartnerId(id: string): void {
+  const list = loadBlockedIds().filter((item) => item !== id);
+  const map = loadBlockedMetaMap();
+  delete map[id];
+  try {
+    localStorage.setItem(KEY_BLOCKED, JSON.stringify(list));
+    localStorage.setItem(KEY_BLOCKED_META, JSON.stringify(map));
+  } catch {
+    // ignore
+  }
+}
+
+export function clearBlockedIds(): void {
+  try {
+    localStorage.removeItem(KEY_BLOCKED);
+    localStorage.removeItem(KEY_BLOCKED_META);
+  } catch {
+    // ignore
+  }
 }
 
 export function loadMatchHistory(): SavedMatchSummary[] {
@@ -105,6 +175,14 @@ export function loadMatchHistory(): SavedMatchSummary[] {
     return raw ? (JSON.parse(raw) as SavedMatchSummary[]) : [];
   } catch {
     return [];
+  }
+}
+
+export function clearMatchHistory(): void {
+  try {
+    localStorage.removeItem(KEY_HISTORY);
+  } catch {
+    // ignore
   }
 }
 
@@ -132,6 +210,7 @@ export interface SessionState {
   serverConfigured: boolean;
   waitingOnlineCount: number | null;
   partner: MatchPartner | null;
+  partnerDisconnected: boolean;
   messages: ChatMessage[];
 }
 
@@ -143,6 +222,7 @@ export class WorldChatSession {
   private searchStatus = '';
   private waitingOnlineCount: number | null = null;
   private partner: MatchPartner | null = null;
+  private partnerDisconnected = false;
   private messages: ChatMessage[] = [];
 
   private roomId: string | null = null;
@@ -150,6 +230,9 @@ export class WorldChatSession {
   private searchStartedAt = 0;
   private pollTimer: number | null = null;
   private bc: BroadcastChannel | null = null;
+  private sessionToken = 0;
+  private isMatchPolling = false;
+  private isRoomPolling = false;
 
   constructor(profile: UserProfile, onChange: (state: SessionState) => void) {
     this.profile = profile;
@@ -167,6 +250,7 @@ export class WorldChatSession {
       serverConfigured: Boolean(getApiUrl()),
       waitingOnlineCount: this.waitingOnlineCount,
       partner: this.partner,
+      partnerDisconnected: this.partnerDisconnected,
       messages: [...this.messages],
     };
   }
@@ -186,23 +270,28 @@ export class WorldChatSession {
     }
   }
 
+  private cleanNickname(): string {
+    return this.profile.nickname.trim().slice(0, 18) || 'Globetrotter';
+  }
+
   startSearch(): void {
-    this.leave(false);
+    this.resetSession(false, true);
+    this.sessionToken += 1;
+    const token = this.sessionToken;
     const targetGender: Gender = this.profile.gender === 'man' ? 'vrouw' : 'man';
-    const targetLabel = targetGender === 'vrouw' ? 'Vrouw ♀️' : 'Man ♂️';
     const api = getApiUrl();
 
     this.phase = 'searching';
     this.partner = null;
+    this.partnerDisconnected = false;
     this.messages = [];
     this.waitingOnlineCount = null;
     this.searchStartedAt = Date.now();
     this.searchStatus = api
-      ? `Zoeken naar een echte ${targetLabel} in jouw gekozen talen...`
-      : `Geen live server URL ingesteld! Stel jouw Backend URL in bij ⚙️ Instellingen (zie RELEASE_STEP_BY_STEP.txt).`;
+      ? 'Connecting to match server...'
+      : 'Online matchmaking unavailable right now';
     this.emit();
 
-    // BroadcastChannel allows 2 real tabs on the same device to test live 1-on-1 without fake bots
     if (typeof BroadcastChannel !== 'undefined') {
       this.bc = new BroadcastChannel('world-match-chat-lobby');
       this.bc.onmessage = (ev: MessageEvent<{
@@ -212,6 +301,7 @@ export class WorldChatSession {
         toDeviceId?: string;
         message?: ChatMessage;
       }>) => {
+        if (token !== this.sessionToken) return;
         const d = ev.data;
         if (!d) return;
         if (d.type === 'SEEK' && this.phase === 'searching' && d.from) {
@@ -227,19 +317,19 @@ export class WorldChatSession {
           this.bc?.postMessage({
             type: 'ACCEPT',
             roomId: room,
-            from: this.profile,
+            from: { ...this.profile, nickname: this.cleanNickname() },
             toDeviceId: d.from.deviceId,
           });
           this.connectToPartner(
             {
               id: d.from.deviceId,
-              nickname: d.from.nickname,
+              nickname: d.from.nickname.trim() || 'Globetrotter',
               gender: d.from.gender,
               countryName: c.name,
               countryFlag: c.flag,
               languages: d.from.languages,
               isRemoteHuman: true,
-              bio: `Live uit ${c.name}`,
+              bio: `Live from ${c.name}`,
             },
             room
           );
@@ -250,22 +340,25 @@ export class WorldChatSession {
           d.from &&
           d.roomId
         ) {
+          const blocked = loadBlockedIds();
+          if (blocked.includes(d.from.deviceId)) return;
           const c = getCountry(d.from.countryCode);
           this.connectToPartner(
             {
               id: d.from.deviceId,
-              nickname: d.from.nickname,
+              nickname: d.from.nickname.trim() || 'Globetrotter',
               gender: d.from.gender,
               countryName: c.name,
               countryFlag: c.flag,
               languages: d.from.languages,
               isRemoteHuman: true,
-              bio: `Live uit ${c.name}`,
+              bio: `Live from ${c.name}`,
             },
             d.roomId
           );
         } else if (d.type === 'MSG' && d.roomId === this.roomId && d.message) {
           if (d.from?.deviceId === this.profile.deviceId) return;
+          if (this.messages.some((m) => m.id === d.message!.id)) return;
           this.messages.push({
             ...d.message,
             sender: 'partner',
@@ -273,50 +366,55 @@ export class WorldChatSession {
           chatSound.incoming();
           if (this.partner) recordMatchHistory(this.partner, d.message.text);
           this.emit();
-        } else if (d.type === 'LEAVE' && d.roomId === this.roomId && this.phase === 'connected') {
-          this.messages.push({
-            id: `sys-${Date.now()}`,
-            sender: 'system',
-            senderName: 'Systeem',
-            text: `${this.partner?.nickname || 'De ander'} heeft de chat verlaten. Tik op "Volgende" voor een nieuwe echte match!`,
-            createdAt: Date.now(),
-          });
-          this.emit();
+        } else if (
+          d.type === 'LEAVE' &&
+          d.roomId === this.roomId &&
+          this.phase === 'connected' &&
+          !this.partnerDisconnected
+        ) {
+          this.handlePartnerLeft();
         }
       };
 
-      this.bc.postMessage({ type: 'SEEK', from: this.profile });
+      this.bc.postMessage({
+        type: 'SEEK',
+        from: { ...this.profile, nickname: this.cleanNickname() },
+      });
     }
 
-    // Real Worker queue matchmaking (NO bots ever!)
     if (api) {
-      void this.tryWorkerMatch(false);
+      void this.tryWorkerMatch(false, token);
       this.pollTimer = window.setInterval(() => {
+        if (token !== this.sessionToken) return;
         if (this.phase === 'searching') {
           const waitedMs = Date.now() - this.searchStartedAt;
           const allowGlobal = waitedMs >= 4000 && this.profile.allowGlobalFallback;
-          if (allowGlobal) {
-            this.searchStatus = `Wachten op een echte ${targetLabel} wereldwijd (alle talen)...`;
-          }
-          void this.tryWorkerMatch(allowGlobal);
-        } else if (this.phase === 'connected' && this.roomId && !this.roomId.startsWith('bc-')) {
-          void this.pollWorkerRoom();
+          void this.tryWorkerMatch(allowGlobal, token);
+        } else if (
+          this.phase === 'connected' &&
+          !this.partnerDisconnected &&
+          this.roomId &&
+          !this.roomId.startsWith('bc-')
+        ) {
+          void this.pollWorkerRoom(token);
         }
       }, 1500);
     }
   }
 
-  private async tryWorkerMatch(allowGlobal: boolean): Promise<void> {
+  private async tryWorkerMatch(allowGlobal: boolean, token: number): Promise<void> {
+    if (this.isMatchPolling) return;
     const api = getApiUrl();
-    if (!api || this.phase !== 'searching') return;
+    if (!api || this.phase !== 'searching' || token !== this.sessionToken) return;
     const c = getCountry(this.profile.countryCode);
+    this.isMatchPolling = true;
     try {
       const res = await fetch(`${api}/api/world-chat/match`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           deviceId: this.profile.deviceId,
-          nickname: this.profile.nickname,
+          nickname: this.cleanNickname(),
           gender: this.profile.gender,
           countryName: c.name,
           countryFlag: c.flag,
@@ -324,8 +422,9 @@ export class WorldChatSession {
           allowGlobal: allowGlobal && this.profile.allowGlobalFallback,
         }),
       });
+      if (token !== this.sessionToken || this.phase !== 'searching') return;
       if (!res.ok) {
-        this.searchStatus = `Server gaf fout (${res.status}). Controleer of de Cloudflare Worker + D1 gedeployed is.`;
+        this.searchStatus = 'Online matchmaking unavailable right now';
         this.emit();
         return;
       }
@@ -335,32 +434,49 @@ export class WorldChatSession {
         roomId?: string;
         partner?: MatchPartner;
       };
+      if (token !== this.sessionToken || this.phase !== 'searching') return;
+
       if (typeof data.waitingCount === 'number') {
         this.waitingOnlineCount = data.waitingCount;
+      }
+      if (data.matched && data.roomId && data.partner) {
+        const blocked = loadBlockedIds();
+        if (blocked.includes(data.partner.id)) {
+          this.searchStatus = allowGlobal
+            ? 'Waiting for a real match worldwide...'
+            : 'Waiting for a real match...';
+          this.emit();
+          return;
+        }
+        this.connectToPartner({ ...data.partner, isRemoteHuman: true }, data.roomId);
+      } else {
+        this.searchStatus = allowGlobal
+          ? 'Waiting for a real match worldwide...'
+          : 'Waiting for a real match...';
         this.emit();
       }
-      if (data.matched && data.roomId && data.partner && this.phase === 'searching') {
-        const blocked = loadBlockedIds();
-        if (blocked.includes(data.partner.id)) return;
-        this.connectToPartner({ ...data.partner, isRemoteHuman: true }, data.roomId);
-      }
     } catch {
-      this.searchStatus =
-        'Kan de match-server niet bereiken. Controleer je internet of Backend URL in ⚙️ Instellingen.';
+      if (token !== this.sessionToken || this.phase !== 'searching') return;
+      this.searchStatus = 'Online matchmaking unavailable right now';
       this.emit();
+    } finally {
+      this.isMatchPolling = false;
     }
   }
 
-  private async pollWorkerRoom(): Promise<void> {
+  private async pollWorkerRoom(token: number): Promise<void> {
+    if (this.isRoomPolling) return;
     const api = getApiUrl();
-    if (!api || !this.roomId) return;
+    const roomId = this.roomId;
+    if (!api || !roomId || token !== this.sessionToken || this.partnerDisconnected) return;
+    this.isRoomPolling = true;
     try {
       const res = await fetch(
-        `${api}/api/world-chat/poll?roomId=${encodeURIComponent(this.roomId)}&deviceId=${encodeURIComponent(
+        `${api}/api/world-chat/poll?roomId=${encodeURIComponent(roomId)}&deviceId=${encodeURIComponent(
           this.profile.deviceId
         )}&since=${this.lastPollSince}`
       );
-      if (!res.ok) return;
+      if (!res.ok || token !== this.sessionToken || this.roomId !== roomId) return;
       const data = (await res.json()) as {
         partnerLeft?: boolean;
         messages?: Array<{
@@ -372,69 +488,103 @@ export class WorldChatSession {
           createdAtMs: number;
         }>;
       };
+      if (token !== this.sessionToken || this.roomId !== roomId) return;
+
+      let hasNewMessage = false;
       if (Array.isArray(data.messages) && data.messages.length > 0) {
         for (const m of data.messages) {
           this.lastPollSince = Math.max(this.lastPollSince, m.createdAtMs);
           if (m.senderId === this.profile.deviceId) continue;
+          const msgId = `srv-${m.id}`;
+          if (this.messages.some((existing) => existing.id === msgId)) continue;
           this.messages.push({
-            id: `srv-${m.id}`,
+            id: msgId,
             sender: 'partner',
             senderName: m.senderName,
             text: m.text,
             lang: m.lang,
             createdAt: m.createdAtMs,
           });
+          hasNewMessage = true;
           chatSound.incoming();
           if (this.partner) recordMatchHistory(this.partner, m.text);
         }
-        this.emit();
       }
       if (data.partnerLeft) {
-        this.messages.push({
-          id: `sys-${Date.now()}`,
-          sender: 'system',
-          senderName: 'Systeem',
-          text: `${this.partner?.nickname || 'De ander'} heeft de chat verlaten. Druk op Volgende ⏭️!`,
-          createdAt: Date.now(),
-        });
-        this.leave(true);
+        this.handlePartnerLeft();
+        return;
+      }
+      if (hasNewMessage) {
+        this.emit();
       }
     } catch {
       // ignore transient network glitches
+    } finally {
+      this.isRoomPolling = false;
     }
+  }
+
+  private handlePartnerLeft(): void {
+    const oldRoom = this.roomId;
+    this.clearTimers();
+    this.roomId = null;
+    this.partnerDisconnected = true;
+
+    const api = getApiUrl();
+    if (api && oldRoom && !oldRoom.startsWith('bc-')) {
+      void fetch(`${api}/api/world-chat/leave`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          deviceId: this.profile.deviceId,
+          roomId: oldRoom,
+        }),
+      }).catch(() => {});
+    }
+
+    this.messages.push({
+      id: `sys-left-${Date.now()}`,
+      sender: 'system',
+      senderName: 'System',
+      text: `${this.partner?.nickname || 'Your partner'} left the chat. Tap Next to find a new match!`,
+      createdAt: Date.now(),
+    });
+    this.emit();
   }
 
   private connectToPartner(partner: MatchPartner, roomId: string): void {
     this.phase = 'connected';
     this.partner = partner;
+    this.partnerDisconnected = false;
     this.roomId = roomId;
     this.lastPollSince = 0;
 
-    const genderTxt = partner.gender === 'vrouw' ? 'Vrouw ♀️' : 'Man ♂️';
+    const genderTxt = partner.gender === 'vrouw' ? 'Woman ♀️' : 'Man ♂️';
     this.messages = [
       {
         id: `sys-connect-${Date.now()}`,
         sender: 'system',
         senderName: 'Match',
-        text: `Live gekoppeld met ${partner.nickname} (${genderTxt}) uit ${partner.countryFlag} ${partner.countryName}!`,
+        text: `Connected with ${partner.nickname} (${genderTxt}) from ${partner.countryFlag} ${partner.countryName}!`,
         createdAt: Date.now(),
       },
     ];
     chatSound.matched();
-    recordMatchHistory(partner, 'Gekoppeld!');
+    recordMatchHistory(partner, 'Matched!');
     this.emit();
   }
 
   sendMessage(rawText: string): void {
     const text = rawText.trim();
-    if (!text || this.phase !== 'connected' || !this.partner) return;
+    if (!text || this.phase !== 'connected' || !this.partner || this.partnerDisconnected) return;
 
+    const senderName = this.cleanNickname();
     const msg: ChatMessage = {
       id: `me-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
       sender: 'me',
-      senderName: this.profile.nickname,
+      senderName,
       text,
-      lang: this.profile.languages[0] || 'nl',
+      lang: this.profile.languages[0] || 'en',
       createdAt: Date.now(),
     };
     this.messages.push(msg);
@@ -446,7 +596,7 @@ export class WorldChatSession {
       this.bc.postMessage({
         type: 'MSG',
         roomId: this.roomId,
-        from: this.profile,
+        from: { ...this.profile, nickname: senderName },
         message: msg,
       });
     } else if (this.roomId) {
@@ -458,7 +608,7 @@ export class WorldChatSession {
           body: JSON.stringify({
             roomId: this.roomId,
             senderId: this.profile.deviceId,
-            senderName: this.profile.nickname,
+            senderName,
             text,
             lang: msg.lang,
           }),
@@ -467,13 +617,14 @@ export class WorldChatSession {
     }
   }
 
-  leave(keepMessages = false): void {
+  private resetSession(keepMessages: boolean, silent: boolean): void {
+    this.sessionToken += 1;
     const oldRoom = this.roomId;
     if (oldRoom?.startsWith('bc-') && this.bc) {
       this.bc.postMessage({ type: 'LEAVE', roomId: oldRoom, from: this.profile });
     }
     const api = getApiUrl();
-    if (api) {
+    if (api && (oldRoom || this.phase === 'searching')) {
       void fetch(`${api}/api/world-chat/leave`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -486,11 +637,18 @@ export class WorldChatSession {
 
     this.clearTimers();
     this.roomId = null;
+    this.partnerDisconnected = false;
     this.phase = 'idle';
     if (!keepMessages) {
       this.partner = null;
       this.messages = [];
     }
-    this.emit();
+    if (!silent) {
+      this.emit();
+    }
+  }
+
+  leave(keepMessages = false): void {
+    this.resetSession(keepMessages, false);
   }
 }

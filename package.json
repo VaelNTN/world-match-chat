@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "WorldMatch Chat - Wereldwijde 1-op-1 chat app met man/vrouw selectie en meertalige matching",
+  "description": "WorldMatch Chat - Global 1-on-1 chat app with gender selection and multilingual matching",
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",

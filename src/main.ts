@@ -1,16 +1,20 @@
 import './style.css';
 import {
   blockPartnerId,
+  clearBlockedIds,
+  clearMatchHistory,
   getApiUrl,
+  loadBlockedUsers,
   loadMatchHistory,
   loadProfile,
   saveProfile,
   SessionState,
   setApiUrl,
+  unblockPartnerId,
   WorldChatSession,
 } from './api/matchmaking';
 import { COUNTRIES, getLangLabel, LANGUAGES } from './chat/chatCatalog';
-import { UserProfile } from './chat/chatTypes';
+import { ChatMessage, SessionPhase, UserProfile } from './chat/chatTypes';
 import { chatSound } from './chat/sound';
 
 const app = document.getElementById('app')!;
@@ -22,6 +26,7 @@ let sessionState: SessionState = {
   serverConfigured: Boolean(getApiUrl()),
   waitingOnlineCount: null,
   partner: null,
+  partnerDisconnected: false,
   messages: [],
 };
 
@@ -30,7 +35,10 @@ const session = new WorldChatSession(profile, (st) => {
   render();
 });
 
-let lastPhaseRendered: string | null = null;
+let lastPhaseRendered: SessionPhase | null = null;
+let currentChatRoomKey: string | null = null;
+const renderedMsgIds = new Set<string>();
+let langsExpanded = false;
 
 function esc(str: string): string {
   return str
@@ -45,80 +53,93 @@ function fmtClock(ts: number): string {
   return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
 }
 
+function formatLangSummary(codes: string[]): string {
+  if (codes.length === LANGUAGES.length) return 'All (18)';
+  const upper = codes.map((c) => c.toUpperCase());
+  if (upper.length <= 3) return upper.join(', ');
+  return `${upper.slice(0, 2).join(', ')} +${upper.length - 2}`;
+}
+
 function render(): void {
   if (sessionState.phase === 'idle') {
     lastPhaseRendered = 'idle';
+    currentChatRoomKey = null;
+    renderedMsgIds.clear();
     renderSetup();
   } else if (sessionState.phase === 'searching') {
-    lastPhaseRendered = 'searching';
-    renderSearching();
+    if (lastPhaseRendered === 'searching' && document.getElementById('search-status-text')) {
+      updateSearchingIncremental();
+    } else {
+      lastPhaseRendered = 'searching';
+      currentChatRoomKey = null;
+      renderedMsgIds.clear();
+      renderSearching();
+    }
   } else {
-    const existingInput = document.getElementById('chat-input') as HTMLInputElement | null;
-    const draft = existingInput ? existingInput.value : '';
-    const hadFocus = existingInput !== null && document.activeElement === existingInput;
-    const wasSamePhase = lastPhaseRendered === 'connected';
-    lastPhaseRendered = 'connected';
-    renderChat(draft, hadFocus && wasSamePhase);
+    const p = sessionState.partner!;
+    const roomKey = `${p.id}:${sessionState.messages[0]?.id || ''}`;
+    if (
+      lastPhaseRendered === 'connected' &&
+      currentChatRoomKey === roomKey &&
+      document.getElementById('messages-list')
+    ) {
+      syncChatIncremental(false);
+    } else {
+      lastPhaseRendered = 'connected';
+      currentChatRoomKey = roomKey;
+      renderedMsgIds.clear();
+      renderChatShell();
+      syncChatIncremental(true);
+    }
   }
 }
 
 function renderSetup(): void {
   const targetText =
     profile.gender === 'man'
-      ? 'Je wordt gekoppeld met een echte Vrouw ♀️ wereldwijd'
-      : 'Je wordt gekoppeld met een echte Man ♂️ wereldwijd';
-  const hasServer = Boolean(getApiUrl());
+      ? 'Match with a Woman ♀️ worldwide'
+      : 'Match with a Man ♂️ worldwide';
 
   app.innerHTML = `
     <div class="app-shell">
       <div class="topbar">
         <div class="brand">
           <h1>🌍 WorldMatch Chat</h1>
-          <span>18+ Wereldwijde 1-op-1 Chat • ${hasServer ? '🟢 Server verbonden' : '🟠 Server nog niet ingesteld'}</span>
+          <span>18+ Global 1-on-1 Chat</span>
         </div>
         <div class="top-actions">
-          <button class="icon-btn" id="btn-mute">${chatSound.isMuted() ? '🔇' : '🔊'}</button>
-          <button class="icon-btn" id="btn-history">🕘</button>
-          <button class="icon-btn" id="btn-settings">⚙️</button>
+          <button class="icon-btn" id="btn-mute" aria-label="Toggle sound">${chatSound.isMuted() ? '🔇' : '🔊'}</button>
+          <button class="icon-btn" id="btn-history" aria-label="Recent matches">🕘</button>
+          <button class="icon-btn" id="btn-settings" aria-label="Settings">⚙️</button>
         </div>
       </div>
 
       <div class="main-scroll">
-        ${
-          !hasServer
-            ? `<div class="card" style="border-color:rgba(245,158,11,0.55);background:rgba(120,53,15,0.28);">
-                <div style="font-size:0.82rem;line-height:1.38;">
-                  ⚠️ <strong>Live server nog niet gekoppeld:</strong> Er worden nooit nep-bots gekoppeld. Zodra je Stap 2 uit <code>RELEASE_STEP_BY_STEP.txt</code> hebt afgerond en je Worker URL invult bij ⚙️ Instellingen, chat je wereldwijd met echte gebruikers!
-                </div>
-              </div>`
-            : ''
-        }
-
         <div class="card">
           <div class="section-label">
-            <span>1. Wie ben jij?</span>
+            <span>1. Who are you?</span>
             <span style="color:#f472b6;font-size:0.72rem;text-transform:none;">${targetText}</span>
           </div>
           <div class="gender-row">
             <button class="gender-btn man ${profile.gender === 'man' ? 'active' : ''}" id="pick-man">
               <span class="g-icon">👨</span>
               <span class="g-title">Man ♂️</span>
-              <span class="g-sub">Chat met Vrouw ♀️</span>
+              <span class="g-sub">Chat with Women ♀️</span>
             </button>
             <button class="gender-btn vrouw ${profile.gender === 'vrouw' ? 'active' : ''}" id="pick-vrouw">
               <span class="g-icon">👩</span>
-              <span class="g-title">Vrouw ♀️</span>
-              <span class="g-sub">Chat met Man ♂️</span>
+              <span class="g-title">Woman ♀️</span>
+              <span class="g-sub">Chat with Men ♂️</span>
             </button>
           </div>
         </div>
 
         <div class="card">
           <div class="section-label">
-            <span>2. Jouw Naam & Land</span>
+            <span>2. Nickname & Country</span>
           </div>
           <div class="field-row">
-            <input class="text-input" id="input-nick" value="${esc(profile.nickname)}" maxlength="18" placeholder="Bijnaam" style="flex:1.2;" />
+            <input class="text-input" id="input-nick" value="${esc(profile.nickname)}" maxlength="18" placeholder="Nickname" style="flex:1.2;" />
             <select class="select-input" id="select-country" style="flex:1;">
               ${COUNTRIES.map(
                 (c) => `<option value="${c.code}" ${c.code === profile.countryCode ? 'selected' : ''}>${c.flag} ${c.name}</option>`
@@ -129,32 +150,49 @@ function renderSetup(): void {
 
         <div class="card">
           <div class="section-label">
-            <span>3. Talen selecteren (${profile.languages.length} gekozen)</span>
-            <button class="icon-btn" id="btn-all-langs" style="padding:4px 9px;font-size:0.72rem;">Alle talen aan</button>
+            <span>3. Languages & Matching</span>
           </div>
-          <div class="lang-grid">
-            ${LANGUAGES.map(
-              (l) => `
-              <button class="lang-chip ${profile.languages.includes(l.code) ? 'active' : ''}" data-lang="${l.code}">
-                ${l.flag} ${l.name}
-              </button>
-            `
-            ).join('')}
-          </div>
+          <button class="lang-summary-btn" id="btn-toggle-langs" type="button" aria-expanded="${langsExpanded}">
+            <span>🌐 Languages (${profile.languages.length}): ${formatLangSummary(profile.languages)}</span>
+            <span>${langsExpanded ? '▴' : '▾'}</span>
+          </button>
+          ${
+            langsExpanded
+              ? `
+            <div class="lang-expand-panel" id="lang-expand-panel">
+              <div class="lang-expand-header">
+                <span>Select your preferred languages</span>
+                <button class="icon-btn" id="btn-all-langs" style="padding:4px 9px;font-size:0.72rem;" type="button">
+                  ${profile.languages.length === LANGUAGES.length ? 'Reset (EN, NL)' : 'Select All'}
+                </button>
+              </div>
+              <div class="lang-grid">
+                ${LANGUAGES.map(
+                  (l) => `
+                  <button class="lang-chip ${profile.languages.includes(l.code) ? 'active' : ''}" data-lang="${l.code}" type="button">
+                    ${l.flag} ${l.name}
+                  </button>
+                `
+                ).join('')}
+              </div>
+            </div>
+          `
+              : ''
+          }
           <div class="toggle-row">
             <div>
-              <strong>🌍 Wereldwijde match-uitbreiding</strong>
-              <div style="font-size:0.73rem;color:#94a3b8;">Als jouw taal rustig is, verruim je na 4s naar alle andere talen wereldwijd.</div>
+              <strong>🌍 Global Language Fallback</strong>
+              <div style="font-size:0.72rem;color:#94a3b8;">Expand to all languages after 4s if quiet.</div>
             </div>
-            <button class="icon-btn" id="btn-global-toggle" style="min-width:64px;${
+            <button class="icon-btn" id="btn-global-toggle" type="button" style="min-width:60px;${
               profile.allowGlobalFallback ? 'border-color:#22c55e;color:#4ade80;' : ''
             }">
-              ${profile.allowGlobalFallback ? 'AAN' : 'UIT'}
+              ${profile.allowGlobalFallback ? 'ON' : 'OFF'}
             </button>
           </div>
         </div>
 
-        <button class="primary-cta" id="btn-find-match">🔍 ZOEK ECHTE WERELDWIJDE MATCH</button>
+        <button class="primary-cta" id="btn-find-match" type="button">🔍 Find Match</button>
       </div>
     </div>
   `;
@@ -181,7 +219,14 @@ function renderSetup(): void {
 
   const nickInput = document.getElementById('input-nick') as HTMLInputElement;
   nickInput.oninput = () => {
-    profile.nickname = nickInput.value.trim().slice(0, 18) || 'Globetrotter';
+    profile.nickname = nickInput.value.slice(0, 18);
+    saveProfile(profile);
+    session.updateProfile(profile);
+  };
+  nickInput.onblur = () => {
+    const cleaned = nickInput.value.trim().slice(0, 18) || 'Globetrotter';
+    nickInput.value = cleaned;
+    profile.nickname = cleaned;
     saveProfile(profile);
     session.updateProfile(profile);
   };
@@ -191,6 +236,11 @@ function renderSetup(): void {
     profile.countryCode = countrySel.value;
     saveProfile(profile);
     session.updateProfile(profile);
+  };
+
+  document.getElementById('btn-toggle-langs')!.onclick = () => {
+    langsExpanded = !langsExpanded;
+    renderSetup();
   };
 
   document.querySelectorAll<HTMLButtonElement>('[data-lang]').forEach((btn) => {
@@ -205,62 +255,76 @@ function renderSetup(): void {
       }
       saveProfile(profile);
       session.updateProfile(profile);
-      render();
+      renderSetup();
     };
   });
 
-  document.getElementById('btn-all-langs')!.onclick = () => {
-    profile.languages = LANGUAGES.map((l) => l.code);
-    saveProfile(profile);
-    session.updateProfile(profile);
-    render();
-  };
+  const allLangsBtn = document.getElementById('btn-all-langs');
+  if (allLangsBtn) {
+    allLangsBtn.onclick = () => {
+      if (profile.languages.length === LANGUAGES.length) {
+        profile.languages = ['en', 'nl'];
+      } else {
+        profile.languages = LANGUAGES.map((l) => l.code);
+      }
+      saveProfile(profile);
+      session.updateProfile(profile);
+      renderSetup();
+    };
+  }
 
   document.getElementById('btn-global-toggle')!.onclick = () => {
     profile.allowGlobalFallback = !profile.allowGlobalFallback;
     saveProfile(profile);
     session.updateProfile(profile);
-    render();
+    renderSetup();
   };
 
   document.getElementById('btn-find-match')!.onclick = () => {
+    if (!profile.nickname.trim()) {
+      profile.nickname = 'Globetrotter';
+      saveProfile(profile);
+      session.updateProfile(profile);
+    }
     session.startSearch();
   };
 }
 
+function getWaitingCountText(): string {
+  if (sessionState.waitingOnlineCount === null) return '';
+  const targetWord = profile.gender === 'man' ? 'women' : 'men';
+  return `Online ${targetWord} waiting: ${sessionState.waitingOnlineCount}`;
+}
+
 function renderSearching(): void {
   const targetIcon = profile.gender === 'man' ? '👩' : '👨';
-  const targetWord = profile.gender === 'man' ? 'vrouwen' : 'mannen';
+  const waitingText = getWaitingCountText();
+
   app.innerHTML = `
     <div class="app-shell">
       <div class="topbar">
         <div class="brand">
           <h1>🌍 WorldMatch Chat</h1>
-          <span>Live Matchmaker (geen bots)</span>
+          <span>Live 1-on-1 Matchmaking</span>
         </div>
-        <button class="icon-btn" id="btn-cancel-search">Annuleren</button>
+        <button class="icon-btn" id="btn-cancel-search" type="button">Cancel</button>
       </div>
 
       <div class="main-scroll">
         <div class="search-box">
           <div class="radar-pulse">${targetIcon}</div>
-          <h2 style="margin:0;font-size:1.18rem;max-width:340px;">${esc(sessionState.searchStatus)}</h2>
-          ${
-            sessionState.waitingOnlineCount !== null
-              ? `<div style="font-size:0.84rem;color:#38bdf8;font-weight:700;">Online ${targetWord} in wachtrij: ${sessionState.waitingOnlineCount}</div>`
-              : ''
-          }
+          <h2 id="search-status-text" style="margin:0;font-size:1.15rem;max-width:320px;">${esc(
+            sessionState.searchStatus
+          )}</h2>
+          <div id="waiting-count-text" style="font-size:0.84rem;color:#38bdf8;font-weight:700;${
+            waitingText ? '' : 'display:none;'
+          }">${esc(waitingText)}</div>
           <p style="margin:0;font-size:0.82rem;color:#94a3b8;max-width:300px;">
-            Gekozen talen: ${profile.languages.slice(0, 6).map((l) => getLangLabel(l)).join(', ')}${
+            Languages: ${profile.languages.slice(0, 6).map((l) => getLangLabel(l)).join(', ')}${
               profile.languages.length > 6 ? ` +${profile.languages.length - 6}` : ''
             }
           </p>
-          ${
-            !sessionState.serverConfigured
-              ? `<button class="icon-btn" id="btn-open-cfg-from-search" style="border-color:#38bdf8;color:#bae6fd;padding:10px 16px;">⚙️ Server URL instellen</button>`
-              : ''
-          }
-          <button class="icon-btn" id="btn-stop-search" style="padding:10px 18px;margin-top:4px;">← Terug naar keuzes</button>
+          <button class="icon-btn" id="btn-stop-search" type="button" style="padding:10px 18px;margin-top:4px;">← Back</button>
         </div>
       </div>
     </div>
@@ -268,11 +332,52 @@ function renderSearching(): void {
 
   document.getElementById('btn-cancel-search')!.onclick = () => session.leave(false);
   document.getElementById('btn-stop-search')!.onclick = () => session.leave(false);
-  const cfgBtn = document.getElementById('btn-open-cfg-from-search');
-  if (cfgBtn) cfgBtn.onclick = () => openSettingsModal();
 }
 
-function renderChat(draftText: string, restoreFocus: boolean): void {
+function updateSearchingIncremental(): void {
+  const statusEl = document.getElementById('search-status-text');
+  if (statusEl && statusEl.textContent !== sessionState.searchStatus) {
+    statusEl.textContent = sessionState.searchStatus;
+  }
+  const waitEl = document.getElementById('waiting-count-text');
+  if (waitEl) {
+    const waitingText = getWaitingCountText();
+    if (waitingText) {
+      waitEl.textContent = waitingText;
+      waitEl.style.display = '';
+    } else {
+      waitEl.style.display = 'none';
+    }
+  }
+}
+
+function createMessageNode(m: ChatMessage): HTMLDivElement {
+  const row = document.createElement('div');
+  row.dataset.msgId = m.id;
+
+  if (m.sender === 'system') {
+    row.className = 'msg-row system';
+    row.innerHTML = `<div class="msg-bubble">${esc(m.text)}</div>`;
+    return row;
+  }
+
+  row.className = `msg-row ${m.sender}`;
+  const translateHref = `https://translate.google.com/?sl=auto&tl=en&text=${encodeURIComponent(m.text)}`;
+  row.innerHTML = `
+    <div class="msg-bubble">${esc(m.text)}</div>
+    <div class="msg-meta">
+      <span>${fmtClock(m.createdAt)}</span>
+      ${
+        m.sender === 'partner'
+          ? `<a class="translate-link" href="${translateHref}" target="_blank" rel="noopener">🌐 Translate</a>`
+          : ''
+      }
+    </div>
+  `;
+  return row;
+}
+
+function renderChatShell(): void {
   const p = sessionState.partner!;
   const gIcon = p.gender === 'vrouw' ? '♀️' : '♂️';
   const langBadges = p.languages.map((l) => getLangLabel(l)).join(' • ');
@@ -280,76 +385,41 @@ function renderChat(draftText: string, restoreFocus: boolean): void {
   app.innerHTML = `
     <div class="app-shell">
       <div class="partner-bar">
-        <button class="icon-btn" id="btn-leave-chat" style="padding:6px 10px;">← Stop</button>
+        <button class="icon-btn" id="btn-leave-chat" type="button" style="padding:6px 10px;">← Stop</button>
         <div class="partner-meta">
           <div class="partner-name">${p.countryFlag} ${esc(p.nickname)} <span style="color:${
             p.gender === 'vrouw' ? '#f472b6' : '#38bdf8'
           };">${gIcon}</span></div>
           <div class="partner-sub">${esc(p.countryName)} • ${langBadges}</div>
         </div>
-        <button class="icon-btn" id="btn-block-partner" title="Blokkeer" style="padding:6px 9px;">🚫</button>
-        <button class="icon-btn" id="btn-next-match" style="padding:6px 11px;border-color:#a855f7;color:#e9d5ff;">⏭️ Volgende</button>
+        <button class="icon-btn" id="btn-block-partner" type="button" title="Block" style="padding:6px 9px;">🚫</button>
+        <button class="icon-btn" id="btn-next-match" type="button" style="padding:6px 11px;border-color:#a855f7;color:#e9d5ff;">⏭️ Next</button>
       </div>
 
       <div class="chat-wrap">
-        <div class="messages-scroll" id="messages-scroll">
-          ${sessionState.messages
-            .map((m) => {
-              if (m.sender === 'system') {
-                return `
-                  <div class="msg-row system">
-                    <div class="msg-bubble">${esc(m.text)}</div>
-                  </div>
-                `;
-              }
-              const translateHref = `https://translate.google.com/?sl=auto&tl=nl&text=${encodeURIComponent(m.text)}`;
-              return `
-                <div class="msg-row ${m.sender}">
-                  <div class="msg-bubble">${esc(m.text)}</div>
-                  <div class="msg-meta">
-                    <span>${fmtClock(m.createdAt)}</span>
-                    ${
-                      m.sender === 'partner'
-                        ? `<a class="translate-link" href="${translateHref}" target="_blank" rel="noopener">🌐 Vertaal</a>`
-                        : ''
-                    }
-                  </div>
-                </div>
-              `;
-            })
-            .join('')}
-        </div>
+        <div class="messages-scroll" id="messages-list"></div>
 
-        <div class="icebreakers">
-          <button class="ice-chip" data-ice="Hoi! Hoe gaat het met je? 👋">👋 Hoi!</button>
-          <button class="ice-chip" data-ice="Hoe is het weer bij jou in ${esc(p.countryName)}? ☀️">🌍 Weer?</button>
-          <button class="ice-chip" data-ice="Wat zijn je hobby's? 😄">🎧 Hobby's?</button>
-          <button class="ice-chip" data-ice="Do you speak English too? 💬">🇬🇧 English?</button>
+        <div class="icebreakers" id="icebreakers-bar">
+          <button class="ice-chip" type="button" data-ice="Hey! How are you? 👋">👋 Hey!</button>
+          <button class="ice-chip" type="button" data-ice="How's the weather in ${esc(p.countryName)}? ☀️">☀️ Weather?</button>
+          <button class="ice-chip" type="button" data-ice="What are your hobbies? 😄">🎧 Hobbies?</button>
+          <button class="ice-chip" type="button" data-ice="Nice to meet you! Where in ${esc(p.countryName)} are you from? 💬">💬 Where from?</button>
         </div>
 
         <form class="composer" id="chat-form">
-          <input class="text-input" id="chat-input" placeholder="Typ een bericht..." autocomplete="off" value="${esc(
-            draftText
-          )}" />
-          <button class="send-btn" type="submit">Stuur</button>
+          <input class="text-input" id="chat-input" placeholder="Type a message..." autocomplete="off" />
+          <button class="send-btn" id="send-btn" type="submit">Send</button>
         </form>
       </div>
     </div>
   `;
 
-  const msgBox = document.getElementById('messages-scroll')!;
-  msgBox.scrollTop = msgBox.scrollHeight;
-
   const chatInput = document.getElementById('chat-input') as HTMLInputElement;
-  if (restoreFocus) {
-    chatInput.focus();
-    chatInput.setSelectionRange(chatInput.value.length, chatInput.value.length);
-  }
 
   document.getElementById('btn-leave-chat')!.onclick = () => session.leave(false);
   document.getElementById('btn-next-match')!.onclick = () => session.startSearch();
   document.getElementById('btn-block-partner')!.onclick = () => {
-    blockPartnerId(p.id);
+    blockPartnerId(p.id, { nickname: p.nickname, countryFlag: p.countryFlag });
     session.startSearch();
   };
 
@@ -362,75 +432,333 @@ function renderChat(draftText: string, restoreFocus: boolean): void {
   document.getElementById('chat-form')!.onsubmit = (e) => {
     e.preventDefault();
     const txt = chatInput.value;
+    if (!txt.trim()) return;
     chatInput.value = '';
     session.sendMessage(txt);
     chatInput.focus();
   };
 }
 
+function syncChatIncremental(forceScrollBottom: boolean): void {
+  const listEl = document.getElementById('messages-list');
+  if (!listEl) return;
+
+  const wasNearBottom = listEl.scrollHeight - listEl.scrollTop - listEl.clientHeight < 90;
+  let appendedAny = false;
+  let appendedMine = false;
+
+  for (const m of sessionState.messages) {
+    if (renderedMsgIds.has(m.id)) continue;
+    renderedMsgIds.add(m.id);
+    listEl.appendChild(createMessageNode(m));
+    appendedAny = true;
+    if (m.sender === 'me') {
+      appendedMine = true;
+    }
+  }
+
+  const chatInput = document.getElementById('chat-input') as HTMLInputElement | null;
+  const sendBtn = document.getElementById('send-btn') as HTMLButtonElement | null;
+  if (sessionState.partnerDisconnected) {
+    if (chatInput && !chatInput.disabled) {
+      chatInput.disabled = true;
+      chatInput.placeholder = 'Partner left — tap Next for a new match';
+    }
+    if (sendBtn && !sendBtn.disabled) {
+      sendBtn.disabled = true;
+    }
+    document.querySelectorAll<HTMLButtonElement>('.ice-chip').forEach((btn) => {
+      btn.disabled = true;
+    });
+  }
+
+  if (appendedAny && (forceScrollBottom || wasNearBottom || appendedMine)) {
+    listEl.scrollTop = listEl.scrollHeight;
+  }
+}
+
 function openHistoryModal(): void {
-  const history = loadMatchHistory();
   const modal = document.createElement('div');
   modal.className = 'modal-backdrop';
-  modal.innerHTML = `
-    <div class="modal-card">
-      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
-        <h3 style="margin:0;">🕘 Recente Matches</h3>
-        <button class="icon-btn" id="close-hist">✕</button>
-      </div>
-      ${
-        history.length === 0
-          ? `<p style="color:#94a3b8;font-size:0.86rem;">Nog geen echte chats gevoerd.</p>`
-          : history
-              .map(
-                (h) => `
-            <div class="history-item">
-              <div>
-                <strong>${h.countryFlag} ${esc(h.partnerName)}</strong> (${
-                  h.partnerGender === 'vrouw' ? '♀️' : '♂️'
-                })
-                <div style="font-size:0.75rem;color:#94a3b8;">${esc(h.lastMessage.slice(0, 42))}</div>
+
+  const drawHistory = () => {
+    const history = loadMatchHistory();
+    modal.innerHTML = `
+      <div class="modal-card">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
+          <h3 style="margin:0;">🕘 Recent Matches</h3>
+          <div style="display:flex;gap:6px;">
+            ${
+              history.length > 0
+                ? `<button class="icon-btn danger-btn" id="clear-hist" type="button" style="padding:5px 10px;font-size:0.76rem;">Clear</button>`
+                : ''
+            }
+            <button class="icon-btn" id="close-hist" type="button">✕</button>
+          </div>
+        </div>
+        ${
+          history.length === 0
+            ? `<p style="color:#94a3b8;font-size:0.86rem;margin:6px 0;">No recent chats yet.</p>`
+            : history
+                .map(
+                  (h) => `
+              <div class="history-item">
+                <div>
+                  <strong>${h.countryFlag} ${esc(h.partnerName)}</strong> (${
+                    h.partnerGender === 'vrouw' ? '♀️' : '♂️'
+                  })
+                  <div style="font-size:0.75rem;color:#94a3b8;">${esc(h.lastMessage.slice(0, 42))}</div>
+                </div>
+                <span style="font-size:0.72rem;color:#64748b;">${fmtClock(h.timestamp)}</span>
               </div>
-              <span style="font-size:0.72rem;color:#64748b;">${fmtClock(h.timestamp)}</span>
-            </div>
-          `
-              )
-              .join('')
-      }
-    </div>
-  `;
+            `
+                )
+                .join('')
+        }
+      </div>
+    `;
+
+    modal.querySelector<HTMLButtonElement>('#close-hist')!.onclick = () => modal.remove();
+    const clearBtn = modal.querySelector<HTMLButtonElement>('#clear-hist');
+    if (clearBtn) {
+      clearBtn.onclick = () => {
+        clearMatchHistory();
+        drawHistory();
+      };
+    }
+  };
+
+  modal.onclick = (e) => {
+    if (e.target === modal) modal.remove();
+  };
+
+  drawHistory();
   document.body.appendChild(modal);
-  modal.querySelector<HTMLButtonElement>('#close-hist')!.onclick = () => modal.remove();
 }
 
 function openSettingsModal(): void {
   const modal = document.createElement('div');
   modal.className = 'modal-backdrop';
-  modal.innerHTML = `
-    <div class="modal-card">
-      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
-        <h3 style="margin:0;">⚙️ Server & Instellingen</h3>
-        <button class="icon-btn" id="close-set">✕</button>
+
+  let secretTapCount = 0;
+  let secretUnlocked = false;
+  let statusNotice = '';
+
+  const drawSettings = () => {
+    const historyCount = loadMatchHistory().length;
+    const blockedUsers = loadBlockedUsers();
+
+    modal.innerHTML = `
+      <div class="modal-card">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+          <h3 id="settings-title" style="margin:0;user-select:none;-webkit-user-select:none;">⚙️ Settings</h3>
+          <button class="icon-btn" id="close-set" type="button">✕</button>
+        </div>
+
+        ${
+          statusNotice
+            ? `<div style="margin-bottom:8px;padding:8px 10px;border-radius:10px;background:rgba(34,197,94,0.16);border:1px solid rgba(34,197,94,0.35);color:#86efac;font-size:0.8rem;">${esc(
+                statusNotice
+              )}</div>`
+            : ''
+        }
+
+        <div class="settings-section">
+          <div class="settings-subtitle">Profile</div>
+          <div class="field-row">
+            <input class="text-input" id="set-nick" value="${esc(profile.nickname)}" maxlength="18" placeholder="Nickname" style="flex:1.2;" />
+            <select class="select-input" id="set-country" style="flex:1;">
+              ${COUNTRIES.map(
+                (c) => `<option value="${c.code}" ${c.code === profile.countryCode ? 'selected' : ''}>${c.flag} ${c.name}</option>`
+              ).join('')}
+            </select>
+          </div>
+        </div>
+
+        <div class="settings-section">
+          <div class="settings-subtitle">Preferences</div>
+          <div class="settings-row">
+            <span>🔊 Sound Effects</span>
+            <button class="icon-btn" id="set-mute-toggle" type="button" style="min-width:60px;${
+              !chatSound.isMuted() ? 'border-color:#22c55e;color:#4ade80;' : ''
+            }">
+              ${chatSound.isMuted() ? 'OFF' : 'ON'}
+            </button>
+          </div>
+          <div class="settings-row">
+            <span>🌍 Global Language Fallback</span>
+            <button class="icon-btn" id="set-global-toggle" type="button" style="min-width:60px;${
+              profile.allowGlobalFallback ? 'border-color:#22c55e;color:#4ade80;' : ''
+            }">
+              ${profile.allowGlobalFallback ? 'ON' : 'OFF'}
+            </button>
+          </div>
+        </div>
+
+        <div class="settings-section">
+          <div class="settings-subtitle">History</div>
+          <div class="settings-row">
+            <span style="color:#cbd5e1;">${historyCount} recent ${historyCount === 1 ? 'chat' : 'chats'} saved</span>
+            <button class="icon-btn danger-btn" id="set-clear-history" type="button" ${
+              historyCount === 0 ? 'disabled style="opacity:0.45;cursor:not-allowed;"' : ''
+            }>Clear History</button>
+          </div>
+        </div>
+
+        <div class="settings-section">
+          <div class="settings-subtitle" style="display:flex;justify-content:space-between;align-items:center;">
+            <span>Blocked Users (${blockedUsers.length})</span>
+            ${
+              blockedUsers.length > 0
+                ? `<button class="icon-btn danger-btn" id="set-clear-blocked" type="button" style="padding:3px 8px;font-size:0.72rem;">Unblock All</button>`
+                : ''
+            }
+          </div>
+          ${
+            blockedUsers.length === 0
+              ? `<div style="font-size:0.82rem;color:#94a3b8;">No blocked users.</div>`
+              : blockedUsers
+                  .map(
+                    (b) => `
+                  <div class="history-item" style="margin-bottom:6px;">
+                    <span>${b.countryFlag} ${esc(b.nickname)}</span>
+                    <button class="icon-btn" data-unblock="${esc(b.id)}" type="button" style="padding:4px 9px;font-size:0.74rem;">Unblock</button>
+                  </div>
+                `
+                  )
+                  .join('')
+          }
+        </div>
+
+        ${
+          secretUnlocked
+            ? `
+          <div class="settings-section" id="secret-server-panel">
+            <div class="settings-subtitle">Custom Match Server</div>
+            <input class="text-input" id="api-url-inp" value="${esc(
+              getApiUrl()
+            )}" placeholder="https://..." style="margin-bottom:10px;" />
+            <div class="field-row">
+              <button class="primary-cta" id="save-api-url" type="button" style="padding:10px;font-size:0.9rem;flex:1;">Save Server URL</button>
+              <button class="icon-btn" id="reset-api-url" type="button" style="padding:10px 12px;">Reset</button>
+            </div>
+          </div>
+        `
+            : ''
+        }
+
+        <div class="settings-footer" id="settings-secret-version">WorldMatch Chat • v1.0.0</div>
       </div>
-      <p style="font-size:0.8rem;color:#94a3b8;margin-top:0;">
-        Vul jouw live Cloudflare Worker URL in (zie <code>RELEASE_STEP_BY_STEP.txt</code>) om gebruikers wereldwijd live aan elkaar te koppelen.
-      </p>
-      <input class="text-input" id="api-url-inp" value="${esc(getApiUrl())}" placeholder="https://arcade-highscores-worker...workers.dev" style="margin-bottom:12px;" />
-      <button class="primary-cta" id="save-set" style="padding:11px;">Opslaan</button>
-    </div>
-  `;
-  document.body.appendChild(modal);
-  modal.querySelector<HTMLButtonElement>('#close-set')!.onclick = () => modal.remove();
-  modal.querySelector<HTMLButtonElement>('#save-set')!.onclick = () => {
-    const val = (modal.querySelector('#api-url-inp') as HTMLInputElement).value;
-    setApiUrl(val);
-    modal.remove();
-    if (sessionState.phase === 'searching') {
-      session.startSearch();
-    } else {
-      render();
+    `;
+
+    modal.querySelector<HTMLButtonElement>('#close-set')!.onclick = () => {
+      modal.remove();
+      if (sessionState.phase === 'idle') renderSetup();
+    };
+
+    const setNick = modal.querySelector('#set-nick') as HTMLInputElement;
+    setNick.oninput = () => {
+      profile.nickname = setNick.value.slice(0, 18);
+      saveProfile(profile);
+      session.updateProfile(profile);
+    };
+    setNick.onblur = () => {
+      const cleaned = setNick.value.trim().slice(0, 18) || 'Globetrotter';
+      setNick.value = cleaned;
+      profile.nickname = cleaned;
+      saveProfile(profile);
+      session.updateProfile(profile);
+    };
+
+    const setCountry = modal.querySelector('#set-country') as HTMLSelectElement;
+    setCountry.onchange = () => {
+      profile.countryCode = setCountry.value;
+      saveProfile(profile);
+      session.updateProfile(profile);
+    };
+
+    modal.querySelector<HTMLButtonElement>('#set-mute-toggle')!.onclick = () => {
+      chatSound.toggleMute();
+      drawSettings();
+      if (sessionState.phase === 'idle') renderSetup();
+    };
+
+    modal.querySelector<HTMLButtonElement>('#set-global-toggle')!.onclick = () => {
+      profile.allowGlobalFallback = !profile.allowGlobalFallback;
+      saveProfile(profile);
+      session.updateProfile(profile);
+      drawSettings();
+      if (sessionState.phase === 'idle') renderSetup();
+    };
+
+    modal.querySelector<HTMLButtonElement>('#set-clear-history')!.onclick = () => {
+      clearMatchHistory();
+      statusNotice = 'Match history cleared.';
+      drawSettings();
+    };
+
+    const clearBlockedBtn = modal.querySelector<HTMLButtonElement>('#set-clear-blocked');
+    if (clearBlockedBtn) {
+      clearBlockedBtn.onclick = () => {
+        clearBlockedIds();
+        statusNotice = 'Blocked list cleared.';
+        drawSettings();
+      };
+    }
+
+    modal.querySelectorAll<HTMLButtonElement>('[data-unblock]').forEach((btn) => {
+      btn.onclick = () => {
+        unblockPartnerId(btn.dataset.unblock!);
+        statusNotice = 'User unblocked.';
+        drawSettings();
+      };
+    });
+
+    const handleSecretTap = () => {
+      if (secretUnlocked) return;
+      secretTapCount += 1;
+      if (secretTapCount >= 5) {
+        secretUnlocked = true;
+        statusNotice = 'Custom server option unlocked.';
+        drawSettings();
+      }
+    };
+    modal.querySelector('#settings-secret-version')!.addEventListener('click', handleSecretTap);
+    modal.querySelector('#settings-title')!.addEventListener('click', handleSecretTap);
+
+    const saveApiBtn = modal.querySelector<HTMLButtonElement>('#save-api-url');
+    if (saveApiBtn) {
+      saveApiBtn.onclick = () => {
+        const val = (modal.querySelector('#api-url-inp') as HTMLInputElement).value;
+        setApiUrl(val);
+        modal.remove();
+        if (sessionState.phase === 'searching') {
+          session.startSearch();
+        } else if (sessionState.phase === 'idle') {
+          renderSetup();
+        }
+      };
+    }
+
+    const resetApiBtn = modal.querySelector<HTMLButtonElement>('#reset-api-url');
+    if (resetApiBtn) {
+      resetApiBtn.onclick = () => {
+        setApiUrl('');
+        statusNotice = 'Custom server URL cleared.';
+        drawSettings();
+      };
     }
   };
+
+  modal.onclick = (e) => {
+    if (e.target === modal) {
+      modal.remove();
+      if (sessionState.phase === 'idle') renderSetup();
+    }
+  };
+
+  drawSettings();
+  document.body.appendChild(modal);
 }
 
 render();
