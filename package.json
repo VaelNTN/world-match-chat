@@ -1,0 +1,23 @@
+{
+  "name": "world-match-chat",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "WorldMatch Chat - Wereldwijde 1-op-1 chat app met man/vrouw selectie en meertalige matching",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "preview": "vite preview",
+    "cap:sync": "npm run build && npx cap sync android"
+  },
+  "dependencies": {
+    "@capacitor/core": "^8.6.2",
+    "@capacitor/device": "^8.0.3"
+  },
+  "devDependencies": {
+    "@capacitor/android": "^8.6.2",
+    "@capacitor/cli": "^8.6.2",
+    "typescript": "^5.7.3",
+    "vite": "^6.2.0"
+  }
+}

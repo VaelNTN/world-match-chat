@@ -1,0 +1,115 @@
+name: Build Android APK & AAB
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+    inputs:
+      play_track:
+        description: 'Google Play track (als service account secret is ingesteld)'
+        required: false
+        default: 'alpha'
+        type: choice
+        options:
+          - internal
+          - alpha
+          - beta
+          - production
+
+jobs:
+  build-android:
+    name: Build app-debug.apk & app-release.aab
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Setup Java 21
+        uses: actions/setup-java@v5
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Install Android SDK 36 & accept licenses
+        run: |
+          SDKMANAGER=$(find "$ANDROID_HOME/cmdline-tools" -name sdkmanager -type f | head -n 1)
+          yes | "$SDKMANAGER" --licenses > /dev/null || true
+          "$SDKMANAGER" "platform-tools" "platforms;android-36" "build-tools;36.0.0"
+
+      - name: Setup Gradle cache
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build web assets
+        env:
+          VITE_API_URL: ${{ vars.VITE_API_URL || vars.HIGHSCORE_API_URL }}
+        run: npm run build
+
+      - name: Sync Capacitor Android
+        run: npx cap sync android
+
+      - name: Make gradlew executable
+        run: chmod +x android/gradlew
+
+      - name: Decode Android upload keystore & check Play config
+        id: play_config
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          PLAY_SA_JSON: ${{ secrets.GOOGLE_PLAY_SERVICE_ACCOUNT_JSON }}
+        run: |
+          if [ -n "$KEYSTORE_B64" ]; then
+            echo "$KEYSTORE_B64" | tr -d '\n\r ' | base64 -d > "${{ runner.temp }}/upload-keystore.jks"
+            echo "ANDROID_KEYSTORE_PATH=${{ runner.temp }}/upload-keystore.jks" >> "$GITHUB_ENV"
+            echo "has_keystore=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_keystore=false" >> "$GITHUB_OUTPUT"
+          fi
+          if [ -n "$PLAY_SA_JSON" ]; then
+            echo "has_play_sa=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_play_sa=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build Debug APK & Release AAB
+        working-directory: android
+        env:
+          ANDROID_VERSION_CODE: ${{ github.run_number }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: ./gradlew assembleDebug bundleRelease --no-daemon
+
+      - name: Upload app-debug.apk
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-debug-apk
+          path: android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+
+      - name: Upload app-release.aab
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-release-aab
+          path: android/app/build/outputs/bundle/release/app-release.aab
+          if-no-files-found: error
+
+      - name: Upload to Google Play Closed Testing (when configured)
+        if: github.event_name != 'pull_request' && steps.play_config.outputs.has_keystore == 'true' && steps.play_config.outputs.has_play_sa == 'true'
+        uses: r0adkll/upload-google-play@v1
+        with:
+          serviceAccountJsonPlainText: ${{ secrets.GOOGLE_PLAY_SERVICE_ACCOUNT_JSON }}
+          packageName: com.worldmatch.chat
+          releaseFiles: android/app/build/outputs/bundle/release/app-release.aab
+          tracks: ${{ inputs.play_track || 'alpha' }}
+          status: completed
