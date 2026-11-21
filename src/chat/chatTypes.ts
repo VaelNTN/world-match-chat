@@ -1,4 +1,5 @@
 export type Gender = 'man' | 'vrouw';
+export type TargetGender = 'any' | 'vrouw' | 'man';
 
 export interface LanguageOption {
   code: string;
@@ -17,9 +18,11 @@ export interface UserProfile {
   deviceId: string;
   nickname: string;
   gender: Gender;
+  targetGender: TargetGender;
   countryCode: string;
   languages: string[];
   allowGlobalFallback: boolean;
+  profanityFilter: boolean;
 }
 
 export interface MatchPartner {
@@ -40,6 +43,7 @@ export interface ChatMessage {
   text: string;
   lang?: string;
   createdAt: number;
+  status?: 'sending' | 'sent' | 'failed';
 }
 
 export type SessionPhase = 'idle' | 'searching' | 'connected';

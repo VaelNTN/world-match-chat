@@ -18,6 +18,9 @@ on:
           - beta
           - production
 
+permissions:
+  contents: write
+
 jobs:
   build-android:
     name: Build app-debug.apk & app-release.aab
@@ -103,6 +106,18 @@ jobs:
           name: app-release-aab
           path: android/app/build/outputs/bundle/release/app-release.aab
           if-no-files-found: error
+
+      - name: Publish WorldMatchChat.apk to GitHub Releases (latest)
+        if: github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp android/app/build/outputs/apk/debug/app-debug.apk WorldMatchChat.apk
+          if gh release view latest >/dev/null 2>&1; then
+            gh release upload latest WorldMatchChat.apk --clobber
+          else
+            gh release create latest WorldMatchChat.apk --title "Latest Build" --notes "Latest automatic Android APK build."
+          fi
 
       - name: Upload to Google Play Closed Testing (when configured)
         if: github.event_name != 'pull_request' && steps.play_config.outputs.has_keystore == 'true' && steps.play_config.outputs.has_play_sa == 'true'

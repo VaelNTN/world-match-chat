@@ -1,10 +1,10 @@
 import { getCountry } from '../chat/chatCatalog';
 import {
   ChatMessage,
-  Gender,
   MatchPartner,
   SavedMatchSummary,
   SessionPhase,
+  TargetGender,
   UserProfile,
 } from '../chat/chatTypes';
 import { chatSound } from '../chat/sound';
@@ -14,6 +14,7 @@ const KEY_API = 'wm_api_url_v1';
 const KEY_HISTORY = 'wm_match_history_v1';
 const KEY_BLOCKED = 'wm_blocked_ids_v1';
 const KEY_BLOCKED_META = 'wm_blocked_meta_v1';
+const KEY_AGE_VERIFIED = 'wm_age_verified_v1';
 
 export interface BlockedUserEntry {
   id: string;
@@ -26,6 +27,27 @@ function createDeviceId(): string {
   return `wm-${Math.random().toString(36).slice(2, 10)}-${Date.now().toString(36)}`;
 }
 
+export function isAgeVerified(): boolean {
+  try {
+    return localStorage.getItem(KEY_AGE_VERIFIED) === '1';
+  } catch {
+    return false;
+  }
+}
+
+export function setAgeVerified(): void {
+  try {
+    localStorage.setItem(KEY_AGE_VERIFIED, '1');
+  } catch {
+    // ignore
+  }
+}
+
+function normalizeTargetGender(val: unknown): TargetGender {
+  if (val === 'man' || val === 'vrouw' || val === 'any') return val;
+  return 'any';
+}
+
 export function loadProfile(): UserProfile {
   try {
     const raw = localStorage.getItem(KEY_PROFILE);
@@ -35,12 +57,14 @@ export function loadProfile(): UserProfile {
         deviceId: parsed.deviceId || createDeviceId(),
         nickname: parsed.nickname || 'Globetrotter',
         gender: parsed.gender === 'vrouw' ? 'vrouw' : 'man',
+        targetGender: normalizeTargetGender(parsed.targetGender),
         countryCode: parsed.countryCode || 'NL',
         languages:
           Array.isArray(parsed.languages) && parsed.languages.length > 0
             ? parsed.languages
             : ['en', 'nl'],
         allowGlobalFallback: parsed.allowGlobalFallback !== false,
+        profanityFilter: parsed.profanityFilter !== false,
       };
     }
   } catch {
@@ -50,9 +74,11 @@ export function loadProfile(): UserProfile {
     deviceId: createDeviceId(),
     nickname: 'Globetrotter',
     gender: 'man',
+    targetGender: 'any',
     countryCode: 'NL',
     languages: ['en', 'nl'],
     allowGlobalFallback: true,
+    profanityFilter: true,
   };
   saveProfile(fresh);
   return fresh;
@@ -204,6 +230,33 @@ function recordMatchHistory(partner: MatchPartner, lastMessage: string): void {
   }
 }
 
+export async function reportPartner(
+  reporterDeviceId: string,
+  reportedDeviceId: string,
+  roomId: string | null,
+  reason: string
+): Promise<boolean> {
+  const api = getApiUrl();
+  if (!api) return false;
+  try {
+    const res = await fetch(`${api}/api/world-chat/report`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        reporterId: reporterDeviceId,
+        reportedId: reportedDeviceId,
+        reporterDeviceId,
+        reportedDeviceId,
+        roomId: roomId || 'unknown',
+        reason,
+      }),
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
 export interface SessionState {
   phase: SessionPhase;
   searchStatus: string;
@@ -211,6 +264,7 @@ export interface SessionState {
   waitingOnlineCount: number | null;
   partner: MatchPartner | null;
   partnerDisconnected: boolean;
+  roomId: string | null;
   messages: ChatMessage[];
 }
 
@@ -226,6 +280,7 @@ export class WorldChatSession {
   private messages: ChatMessage[] = [];
 
   private roomId: string | null = null;
+  private lastMessageId = 0;
   private lastPollSince = 0;
   private searchStartedAt = 0;
   private pollTimer: number | null = null;
@@ -251,7 +306,8 @@ export class WorldChatSession {
       waitingOnlineCount: this.waitingOnlineCount,
       partner: this.partner,
       partnerDisconnected: this.partnerDisconnected,
-      messages: [...this.messages],
+      roomId: this.roomId,
+      messages: this.messages.map((m) => ({ ...m })),
     };
   }
 
@@ -274,11 +330,21 @@ export class WorldChatSession {
     return this.profile.nickname.trim().slice(0, 18) || 'Globetrotter';
   }
 
+  private matchesTargetPref(candidate: UserProfile): boolean {
+    if (this.profile.targetGender !== 'any' && candidate.gender !== this.profile.targetGender) {
+      return false;
+    }
+    const candTarget = candidate.targetGender ?? 'any';
+    if (candTarget !== 'any' && this.profile.gender !== candTarget) {
+      return false;
+    }
+    return true;
+  }
+
   startSearch(): void {
     this.resetSession(false, true);
     this.sessionToken += 1;
     const token = this.sessionToken;
-    const targetGender: Gender = this.profile.gender === 'man' ? 'vrouw' : 'man';
     const api = getApiUrl();
 
     this.phase = 'searching';
@@ -306,7 +372,7 @@ export class WorldChatSession {
         if (!d) return;
         if (d.type === 'SEEK' && this.phase === 'searching' && d.from) {
           if (d.from.deviceId === this.profile.deviceId) return;
-          if (d.from.gender !== targetGender) return;
+          if (!this.matchesTargetPref(d.from)) return;
           const blocked = loadBlockedIds();
           if (blocked.includes(d.from.deviceId)) return;
           const hasSharedLang = d.from.languages.some((l) => this.profile.languages.includes(l));
@@ -342,6 +408,7 @@ export class WorldChatSession {
         ) {
           const blocked = loadBlockedIds();
           if (blocked.includes(d.from.deviceId)) return;
+          if (!this.matchesTargetPref(d.from)) return;
           const c = getCountry(d.from.countryCode);
           this.connectToPartner(
             {
@@ -362,6 +429,7 @@ export class WorldChatSession {
           this.messages.push({
             ...d.message,
             sender: 'partner',
+            status: 'sent',
           });
           chatSound.incoming();
           if (this.partner) recordMatchHistory(this.partner, d.message.text);
@@ -407,6 +475,7 @@ export class WorldChatSession {
     const api = getApiUrl();
     if (!api || this.phase !== 'searching' || token !== this.sessionToken) return;
     const c = getCountry(this.profile.countryCode);
+    const blockedIds = loadBlockedIds();
     this.isMatchPolling = true;
     try {
       const res = await fetch(`${api}/api/world-chat/match`, {
@@ -416,6 +485,8 @@ export class WorldChatSession {
           deviceId: this.profile.deviceId,
           nickname: this.cleanNickname(),
           gender: this.profile.gender,
+          targetGender: this.profile.targetGender,
+          blockedIds,
           countryName: c.name,
           countryFlag: c.flag,
           languages: this.profile.languages,
@@ -440,8 +511,17 @@ export class WorldChatSession {
         this.waitingOnlineCount = data.waitingCount;
       }
       if (data.matched && data.roomId && data.partner) {
-        const blocked = loadBlockedIds();
-        if (blocked.includes(data.partner.id)) {
+        const latestBlocked = loadBlockedIds();
+        if (latestBlocked.includes(data.partner.id)) {
+          // Immediately leave if somehow matched with a blocked user
+          void fetch(`${api}/api/world-chat/leave`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              deviceId: this.profile.deviceId,
+              roomId: data.roomId,
+            }),
+          }).catch(() => {});
           this.searchStatus = allowGlobal
             ? 'Waiting for a real match worldwide...'
             : 'Waiting for a real match...';
@@ -471,11 +551,13 @@ export class WorldChatSession {
     if (!api || !roomId || token !== this.sessionToken || this.partnerDisconnected) return;
     this.isRoomPolling = true;
     try {
-      const res = await fetch(
-        `${api}/api/world-chat/poll?roomId=${encodeURIComponent(roomId)}&deviceId=${encodeURIComponent(
-          this.profile.deviceId
-        )}&since=${this.lastPollSince}`
-      );
+      const qs = new URLSearchParams({
+        roomId,
+        deviceId: this.profile.deviceId,
+        afterId: String(this.lastMessageId),
+        since: String(this.lastPollSince),
+      });
+      const res = await fetch(`${api}/api/world-chat/poll?${qs.toString()}`);
       if (!res.ok || token !== this.sessionToken || this.roomId !== roomId) return;
       const data = (await res.json()) as {
         partnerLeft?: boolean;
@@ -493,7 +575,12 @@ export class WorldChatSession {
       let hasNewMessage = false;
       if (Array.isArray(data.messages) && data.messages.length > 0) {
         for (const m of data.messages) {
-          this.lastPollSince = Math.max(this.lastPollSince, m.createdAtMs);
+          if (typeof m.id === 'number' && m.id > this.lastMessageId) {
+            this.lastMessageId = m.id;
+          }
+          if (typeof m.createdAtMs === 'number' && m.createdAtMs > this.lastPollSince) {
+            this.lastPollSince = m.createdAtMs;
+          }
           if (m.senderId === this.profile.deviceId) continue;
           const msgId = `srv-${m.id}`;
           if (this.messages.some((existing) => existing.id === msgId)) continue;
@@ -504,6 +591,7 @@ export class WorldChatSession {
             text: m.text,
             lang: m.lang,
             createdAt: m.createdAtMs,
+            status: 'sent',
           });
           hasNewMessage = true;
           chatSound.incoming();
@@ -557,6 +645,7 @@ export class WorldChatSession {
     this.partner = partner;
     this.partnerDisconnected = false;
     this.roomId = roomId;
+    this.lastMessageId = 0;
     this.lastPollSince = 0;
 
     const genderTxt = partner.gender === 'vrouw' ? 'Woman ♀️' : 'Man ♂️';
@@ -574,11 +663,45 @@ export class WorldChatSession {
     this.emit();
   }
 
+  private async deliverRemoteMessage(msg: ChatMessage, roomId: string, token: number): Promise<void> {
+    const api = getApiUrl();
+    if (!api) {
+      msg.status = 'failed';
+      this.emit();
+      return;
+    }
+    try {
+      const res = await fetch(`${api}/api/world-chat/send`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          roomId,
+          senderId: this.profile.deviceId,
+          senderName: msg.senderName,
+          text: msg.text,
+          lang: msg.lang || 'en',
+        }),
+      });
+      if (token !== this.sessionToken || this.roomId !== roomId) return;
+      if (!res.ok) {
+        msg.status = 'failed';
+      } else {
+        msg.status = 'sent';
+      }
+      this.emit();
+    } catch {
+      if (token !== this.sessionToken || this.roomId !== roomId) return;
+      msg.status = 'failed';
+      this.emit();
+    }
+  }
+
   sendMessage(rawText: string): void {
     const text = rawText.trim();
     if (!text || this.phase !== 'connected' || !this.partner || this.partnerDisconnected) return;
 
     const senderName = this.cleanNickname();
+    const isBc = Boolean(this.roomId?.startsWith('bc-'));
     const msg: ChatMessage = {
       id: `me-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
       sender: 'me',
@@ -586,13 +709,14 @@ export class WorldChatSession {
       text,
       lang: this.profile.languages[0] || 'en',
       createdAt: Date.now(),
+      status: isBc ? 'sent' : 'sending',
     };
     this.messages.push(msg);
     chatSound.sent();
     recordMatchHistory(this.partner, text);
     this.emit();
 
-    if (this.roomId?.startsWith('bc-') && this.bc) {
+    if (isBc && this.bc && this.roomId) {
       this.bc.postMessage({
         type: 'MSG',
         roomId: this.roomId,
@@ -600,21 +724,17 @@ export class WorldChatSession {
         message: msg,
       });
     } else if (this.roomId) {
-      const api = getApiUrl();
-      if (api) {
-        void fetch(`${api}/api/world-chat/send`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            roomId: this.roomId,
-            senderId: this.profile.deviceId,
-            senderName,
-            text,
-            lang: msg.lang,
-          }),
-        }).catch(() => {});
-      }
+      void this.deliverRemoteMessage(msg, this.roomId, this.sessionToken);
     }
+  }
+
+  retryMessage(msgId: string): void {
+    if (this.phase !== 'connected' || this.partnerDisconnected || !this.roomId) return;
+    const msg = this.messages.find((m) => m.id === msgId && m.sender === 'me' && m.status === 'failed');
+    if (!msg) return;
+    msg.status = 'sending';
+    this.emit();
+    void this.deliverRemoteMessage(msg, this.roomId, this.sessionToken);
   }
 
   private resetSession(keepMessages: boolean, silent: boolean): void {
@@ -637,6 +757,8 @@ export class WorldChatSession {
 
     this.clearTimers();
     this.roomId = null;
+    this.lastMessageId = 0;
+    this.lastPollSince = 0;
     this.partnerDisconnected = false;
     this.phase = 'idle';
     if (!keepMessages) {

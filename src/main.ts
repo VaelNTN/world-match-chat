@@ -4,17 +4,21 @@ import {
   clearBlockedIds,
   clearMatchHistory,
   getApiUrl,
+  isAgeVerified,
   loadBlockedUsers,
   loadMatchHistory,
   loadProfile,
+  reportPartner,
   saveProfile,
   SessionState,
+  setAgeVerified,
   setApiUrl,
   unblockPartnerId,
   WorldChatSession,
 } from './api/matchmaking';
 import { COUNTRIES, getLangLabel, LANGUAGES } from './chat/chatCatalog';
-import { ChatMessage, SessionPhase, UserProfile } from './chat/chatTypes';
+import { ChatMessage, MatchPartner, SessionPhase, TargetGender, UserProfile } from './chat/chatTypes';
+import { filterProfanity } from './chat/profanity';
 import { chatSound } from './chat/sound';
 
 const app = document.getElementById('app')!;
@@ -27,6 +31,7 @@ let sessionState: SessionState = {
   waitingOnlineCount: null,
   partner: null,
   partnerDisconnected: false,
+  roomId: null,
   messages: [],
 };
 
@@ -38,7 +43,11 @@ const session = new WorldChatSession(profile, (st) => {
 let lastPhaseRendered: SessionPhase | null = null;
 let currentChatRoomKey: string | null = null;
 const renderedMsgIds = new Set<string>();
+const renderedMsgStatus = new Map<string, ChatMessage['status']>();
 let langsExpanded = false;
+let toastTimer = 0;
+
+const REPORT_REASONS = ['Spam', 'Harassment', 'Inappropriate', 'Underage'] as const;
 
 function esc(str: string): string {
   return str
@@ -60,11 +69,26 @@ function formatLangSummary(codes: string[]): string {
   return `${upper.slice(0, 2).join(', ')} +${upper.length - 2}`;
 }
 
+function displayText(raw: string): string {
+  return profile.profanityFilter ? filterProfanity(raw) : raw;
+}
+
+function showToast(msg: string): void {
+  document.querySelector('.wm-toast')?.remove();
+  const el = document.createElement('div');
+  el.className = 'wm-toast';
+  el.textContent = msg;
+  document.body.appendChild(el);
+  window.clearTimeout(toastTimer);
+  toastTimer = window.setTimeout(() => el.remove(), 3200);
+}
+
 function render(): void {
   if (sessionState.phase === 'idle') {
     lastPhaseRendered = 'idle';
     currentChatRoomKey = null;
     renderedMsgIds.clear();
+    renderedMsgStatus.clear();
     renderSetup();
   } else if (sessionState.phase === 'searching') {
     if (lastPhaseRendered === 'searching' && document.getElementById('search-status-text')) {
@@ -73,6 +97,7 @@ function render(): void {
       lastPhaseRendered = 'searching';
       currentChatRoomKey = null;
       renderedMsgIds.clear();
+      renderedMsgStatus.clear();
       renderSearching();
     }
   } else {
@@ -88,17 +113,21 @@ function render(): void {
       lastPhaseRendered = 'connected';
       currentChatRoomKey = roomKey;
       renderedMsgIds.clear();
+      renderedMsgStatus.clear();
       renderChatShell();
       syncChatIncremental(true);
     }
   }
 }
 
+function targetPrefSummary(pref: TargetGender): string {
+  if (pref === 'vrouw') return 'Match with Women ♀️';
+  if (pref === 'man') return 'Match with Men ♂️';
+  return 'Match with Anyone 🌍';
+}
+
 function renderSetup(): void {
-  const targetText =
-    profile.gender === 'man'
-      ? 'Match with a Woman ♀️ worldwide'
-      : 'Match with a Man ♂️ worldwide';
+  const targetText = targetPrefSummary(profile.targetGender);
 
   app.innerHTML = `
     <div class="app-shell">
@@ -121,16 +150,23 @@ function renderSetup(): void {
             <span style="color:#f472b6;font-size:0.72rem;text-transform:none;">${targetText}</span>
           </div>
           <div class="gender-row">
-            <button class="gender-btn man ${profile.gender === 'man' ? 'active' : ''}" id="pick-man">
+            <button class="gender-btn man ${profile.gender === 'man' ? 'active' : ''}" id="pick-man" type="button">
               <span class="g-icon">👨</span>
               <span class="g-title">Man ♂️</span>
-              <span class="g-sub">Chat with Women ♀️</span>
             </button>
-            <button class="gender-btn vrouw ${profile.gender === 'vrouw' ? 'active' : ''}" id="pick-vrouw">
+            <button class="gender-btn vrouw ${profile.gender === 'vrouw' ? 'active' : ''}" id="pick-vrouw" type="button">
               <span class="g-icon">👩</span>
               <span class="g-title">Woman ♀️</span>
-              <span class="g-sub">Chat with Men ♂️</span>
             </button>
+          </div>
+
+          <div class="pref-block">
+            <div class="pref-label">Match with</div>
+            <div class="pref-row" role="group" aria-label="Match preference">
+              <button class="pref-btn ${profile.targetGender === 'any' ? 'active any' : ''}" data-target-gender="any" type="button">🌍 Anyone</button>
+              <button class="pref-btn ${profile.targetGender === 'vrouw' ? 'active vrouw' : ''}" data-target-gender="vrouw" type="button">👩 Women</button>
+              <button class="pref-btn ${profile.targetGender === 'man' ? 'active man' : ''}" data-target-gender="man" type="button">👨 Men</button>
+            </div>
           </div>
         </div>
 
@@ -217,6 +253,16 @@ function renderSetup(): void {
     render();
   };
 
+  document.querySelectorAll<HTMLButtonElement>('[data-target-gender]').forEach((btn) => {
+    btn.onclick = () => {
+      const val = btn.dataset.targetGender as TargetGender;
+      profile.targetGender = val;
+      saveProfile(profile);
+      session.updateProfile(profile);
+      renderSetup();
+    };
+  });
+
   const nickInput = document.getElementById('input-nick') as HTMLInputElement;
   nickInput.oninput = () => {
     profile.nickname = nickInput.value.slice(0, 18);
@@ -292,12 +338,18 @@ function renderSetup(): void {
 
 function getWaitingCountText(): string {
   if (sessionState.waitingOnlineCount === null) return '';
-  const targetWord = profile.gender === 'man' ? 'women' : 'men';
+  const targetWord =
+    profile.targetGender === 'vrouw'
+      ? 'women'
+      : profile.targetGender === 'man'
+        ? 'men'
+        : 'people';
   return `Online ${targetWord} waiting: ${sessionState.waitingOnlineCount}`;
 }
 
 function renderSearching(): void {
-  const targetIcon = profile.gender === 'man' ? '👩' : '👨';
+  const targetIcon =
+    profile.targetGender === 'vrouw' ? '👩' : profile.targetGender === 'man' ? '👨' : '🌍';
   const waitingText = getWaitingCountText();
 
   app.innerHTML = `
@@ -320,9 +372,10 @@ function renderSearching(): void {
             waitingText ? '' : 'display:none;'
           }">${esc(waitingText)}</div>
           <p style="margin:0;font-size:0.82rem;color:#94a3b8;max-width:300px;">
-            Languages: ${profile.languages.slice(0, 6).map((l) => getLangLabel(l)).join(', ')}${
-              profile.languages.length > 6 ? ` +${profile.languages.length - 6}` : ''
-            }
+            ${targetPrefSummary(profile.targetGender)} • Languages: ${profile.languages
+              .slice(0, 6)
+              .map((l) => getLangLabel(l))
+              .join(', ')}${profile.languages.length > 6 ? ` +${profile.languages.length - 6}` : ''}
           </p>
           <button class="icon-btn" id="btn-stop-search" type="button" style="padding:10px 18px;margin-top:4px;">← Back</button>
         </div>
@@ -351,6 +404,30 @@ function updateSearchingIncremental(): void {
   }
 }
 
+function renderMessageStatusHtml(m: ChatMessage): string {
+  if (m.sender !== 'me') return '';
+  if (m.status === 'failed') {
+    return `<button type="button" class="retry-badge" data-retry-id="${esc(m.id)}">⚠️ Failed — Tap to retry</button>`;
+  }
+  if (m.status === 'sending') {
+    return `<span class="sending-badge">Sending...</span>`;
+  }
+  return '';
+}
+
+function updateMessageStatusDom(row: HTMLElement, m: ChatMessage): void {
+  const slot = row.querySelector<HTMLElement>('.msg-status-slot');
+  if (!slot) return;
+  row.classList.toggle('is-failed', m.status === 'failed');
+  slot.innerHTML = renderMessageStatusHtml(m);
+  const retryBtn = slot.querySelector<HTMLButtonElement>('[data-retry-id]');
+  if (retryBtn) {
+    retryBtn.onclick = () => {
+      session.retryMessage(m.id);
+    };
+  }
+}
+
 function createMessageNode(m: ChatMessage): HTMLDivElement {
   const row = document.createElement('div');
   row.dataset.msgId = m.id;
@@ -361,19 +438,23 @@ function createMessageNode(m: ChatMessage): HTMLDivElement {
     return row;
   }
 
-  row.className = `msg-row ${m.sender}`;
+  const shownText = m.sender === 'partner' ? displayText(m.text) : m.text;
+  row.className = `msg-row ${m.sender}${m.status === 'failed' ? ' is-failed' : ''}`;
   const translateHref = `https://translate.google.com/?sl=auto&tl=en&text=${encodeURIComponent(m.text)}`;
   row.innerHTML = `
-    <div class="msg-bubble">${esc(m.text)}</div>
+    <div class="msg-bubble">${esc(shownText)}</div>
     <div class="msg-meta">
       <span>${fmtClock(m.createdAt)}</span>
       ${
         m.sender === 'partner'
-          ? `<a class="translate-link" href="${translateHref}" target="_blank" rel="noopener">🌐 Translate</a>`
-          : ''
+          ? `<a class="translate-link" href="${translateHref}" target="_blank" rel="noopener noreferrer">🌐 Translate</a>`
+          : `<span class="msg-status-slot"></span>`
       }
     </div>
   `;
+  if (m.sender === 'me') {
+    updateMessageStatusDom(row, m);
+  }
   return row;
 }
 
@@ -385,15 +466,20 @@ function renderChatShell(): void {
   app.innerHTML = `
     <div class="app-shell">
       <div class="partner-bar">
-        <button class="icon-btn" id="btn-leave-chat" type="button" style="padding:6px 10px;">← Stop</button>
+        <button class="icon-btn bar-btn" id="btn-leave-chat" type="button">← Stop</button>
         <div class="partner-meta">
-          <div class="partner-name">${p.countryFlag} ${esc(p.nickname)} <span style="color:${
-            p.gender === 'vrouw' ? '#f472b6' : '#38bdf8'
-          };">${gIcon}</span></div>
+          <div class="partner-name" title="${esc(p.nickname)}">
+            <span class="partner-flag">${p.countryFlag}</span>
+            <span class="partner-name-text">${esc(p.nickname)}</span>
+            <span class="partner-gender" style="color:${p.gender === 'vrouw' ? '#f472b6' : '#38bdf8'};">${gIcon}</span>
+          </div>
           <div class="partner-sub">${esc(p.countryName)} • ${langBadges}</div>
         </div>
-        <button class="icon-btn" id="btn-block-partner" type="button" title="Block" style="padding:6px 9px;">🚫</button>
-        <button class="icon-btn" id="btn-next-match" type="button" style="padding:6px 11px;border-color:#a855f7;color:#e9d5ff;">⏭️ Next</button>
+        <div class="partner-actions">
+          <button class="icon-btn bar-icon-btn" id="btn-report-partner" type="button" title="Report user" aria-label="Report user">🚩</button>
+          <button class="icon-btn bar-icon-btn" id="btn-block-partner" type="button" title="Block user" aria-label="Block user">🚫</button>
+          <button class="icon-btn bar-btn bar-next-btn" id="btn-next-match" type="button">⏭️ Next</button>
+        </div>
       </div>
 
       <div class="chat-wrap">
@@ -418,9 +504,13 @@ function renderChatShell(): void {
 
   document.getElementById('btn-leave-chat')!.onclick = () => session.leave(false);
   document.getElementById('btn-next-match')!.onclick = () => session.startSearch();
+  document.getElementById('btn-report-partner')!.onclick = () => {
+    openReportModal(p, sessionState.roomId);
+  };
   document.getElementById('btn-block-partner')!.onclick = () => {
     blockPartnerId(p.id, { nickname: p.nickname, countryFlag: p.countryFlag });
-    session.startSearch();
+    session.leave(false);
+    showToast(`🚫 Blocked ${p.nickname}.`);
   };
 
   document.querySelectorAll<HTMLButtonElement>('[data-ice]').forEach((btn) => {
@@ -448,13 +538,30 @@ function syncChatIncremental(forceScrollBottom: boolean): void {
   let appendedMine = false;
 
   for (const m of sessionState.messages) {
-    if (renderedMsgIds.has(m.id)) continue;
-    renderedMsgIds.add(m.id);
-    listEl.appendChild(createMessageNode(m));
-    appendedAny = true;
-    if (m.sender === 'me') {
-      appendedMine = true;
+    if (!renderedMsgIds.has(m.id)) {
+      renderedMsgIds.add(m.id);
+      renderedMsgStatus.set(m.id, m.status);
+      listEl.appendChild(createMessageNode(m));
+      appendedAny = true;
+      if (m.sender === 'me') {
+        appendedMine = true;
+      }
+    } else if (m.sender === 'me' && renderedMsgStatus.get(m.id) !== m.status) {
+      renderedMsgStatus.set(m.id, m.status);
+      const existingNode = listEl.querySelector<HTMLElement>(`[data-msg-id="${CSS.escape(m.id)}"]`);
+      if (existingNode) {
+        updateMessageStatusDom(existingNode, m);
+      }
     }
+  }
+
+  // Hide icebreakers automatically once any real conversation message exists
+  const iceBar = document.getElementById('icebreakers-bar');
+  if (iceBar) {
+    const hasConversationMsg = sessionState.messages.some(
+      (m) => m.sender === 'me' || m.sender === 'partner'
+    );
+    iceBar.classList.toggle('is-hidden', hasConversationMsg || sessionState.partnerDisconnected);
   }
 
   const chatInput = document.getElementById('chat-input') as HTMLInputElement | null;
@@ -475,6 +582,104 @@ function syncChatIncremental(forceScrollBottom: boolean): void {
   if (appendedAny && (forceScrollBottom || wasNearBottom || appendedMine)) {
     listEl.scrollTop = listEl.scrollHeight;
   }
+}
+
+function openAgeGateModal(): void {
+  if (document.getElementById('age-gate-modal')) return;
+  const modal = document.createElement('div');
+  modal.className = 'modal-backdrop age-gate-backdrop';
+  modal.id = 'age-gate-modal';
+  modal.innerHTML = `
+    <div class="modal-card age-gate-card">
+      <div class="age-badge">18+</div>
+      <h2 style="margin:0 0 6px;font-size:1.25rem;text-align:center;">Adults Only (18+)</h2>
+      <p style="margin:0 0 12px;font-size:0.86rem;color:#cbd5e1;text-align:center;line-height:1.45;">
+        WorldMatch Chat connects adults worldwide for live 1-on-1 conversations. Please confirm you are at least 18 years old and agree to our community guidelines:
+      </p>
+      <ul class="guidelines-list">
+        <li>Be respectful — no harassment, hate speech, or abuse.</li>
+        <li>No spam, scams, or explicit/illegal content.</li>
+        <li>Use 🚩 Report or 🚫 Block immediately if someone breaks the rules.</li>
+      </ul>
+      <button class="primary-cta" id="btn-age-confirm" type="button" style="margin-top:12px;">
+        ✅ I am 18+ & Agree
+      </button>
+    </div>
+  `;
+  modal.querySelector<HTMLButtonElement>('#btn-age-confirm')!.onclick = () => {
+    setAgeVerified();
+    modal.remove();
+  };
+  document.body.appendChild(modal);
+}
+
+function openReportModal(partner: MatchPartner, roomId: string | null): void {
+  const modal = document.createElement('div');
+  modal.className = 'modal-backdrop';
+  let selectedReason: string = REPORT_REASONS[0];
+  let submitting = false;
+
+  const draw = () => {
+    modal.innerHTML = `
+      <div class="modal-card">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+          <h3 style="margin:0;">🚩 Report ${esc(partner.nickname)}</h3>
+          <button class="icon-btn" id="close-report" type="button">✕</button>
+        </div>
+        <p style="margin:0 0 10px;font-size:0.82rem;color:#94a3b8;line-height:1.4;">
+          Select a reason below. Reporting will also automatically block this user and leave the chat.
+        </p>
+        <div class="report-reasons">
+          ${REPORT_REASONS.map(
+            (reason) => `
+            <button
+              type="button"
+              class="report-reason-btn ${selectedReason === reason ? 'active' : ''}"
+              data-reason="${esc(reason)}"
+            >
+              <span>${esc(reason)}</span>
+              <span>${selectedReason === reason ? '●' : '○'}</span>
+            </button>
+          `
+          ).join('')}
+        </div>
+        <div class="field-row" style="margin-top:12px;">
+          <button class="icon-btn" id="cancel-report" type="button" style="flex:0.8;">Cancel</button>
+          <button class="icon-btn danger-btn" id="submit-report" type="button" style="flex:1.4;padding:11px 12px;" ${
+            submitting ? 'disabled' : ''
+          }>
+            ${submitting ? 'Submitting...' : '🚩 Submit Report & Block'}
+          </button>
+        </div>
+      </div>
+    `;
+
+    modal.querySelector<HTMLButtonElement>('#close-report')!.onclick = () => modal.remove();
+    modal.querySelector<HTMLButtonElement>('#cancel-report')!.onclick = () => modal.remove();
+    modal.querySelectorAll<HTMLButtonElement>('[data-reason]').forEach((btn) => {
+      btn.onclick = () => {
+        selectedReason = btn.dataset.reason || REPORT_REASONS[0];
+        draw();
+      };
+    });
+    modal.querySelector<HTMLButtonElement>('#submit-report')!.onclick = async () => {
+      if (submitting) return;
+      submitting = true;
+      draw();
+      await reportPartner(profile.deviceId, partner.id, roomId, selectedReason);
+      blockPartnerId(partner.id, { nickname: partner.nickname, countryFlag: partner.countryFlag });
+      modal.remove();
+      session.leave(false);
+      showToast(`🚩 Report submitted (${selectedReason}) & user blocked.`);
+    };
+  };
+
+  modal.onclick = (e) => {
+    if (e.target === modal && !submitting) modal.remove();
+  };
+
+  draw();
+  document.body.appendChild(modal);
 }
 
 function openHistoryModal(): void {
@@ -503,13 +708,15 @@ function openHistoryModal(): void {
                 .map(
                   (h) => `
               <div class="history-item">
-                <div>
+                <div style="min-width:0;flex:1;">
                   <strong>${h.countryFlag} ${esc(h.partnerName)}</strong> (${
                     h.partnerGender === 'vrouw' ? '♀️' : '♂️'
                   })
-                  <div style="font-size:0.75rem;color:#94a3b8;">${esc(h.lastMessage.slice(0, 42))}</div>
+                  <div style="font-size:0.75rem;color:#94a3b8;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${esc(
+                    displayText(h.lastMessage).slice(0, 46)
+                  )}</div>
                 </div>
-                <span style="font-size:0.72rem;color:#64748b;">${fmtClock(h.timestamp)}</span>
+                <span style="font-size:0.72rem;color:#64748b;flex-shrink:0;">${fmtClock(h.timestamp)}</span>
               </div>
             `
                 )
@@ -576,7 +783,7 @@ function openSettingsModal(): void {
         </div>
 
         <div class="settings-section">
-          <div class="settings-subtitle">Preferences</div>
+          <div class="settings-subtitle">Preferences & Safety</div>
           <div class="settings-row">
             <span>🔊 Sound Effects</span>
             <button class="icon-btn" id="set-mute-toggle" type="button" style="min-width:60px;${
@@ -591,6 +798,17 @@ function openSettingsModal(): void {
               profile.allowGlobalFallback ? 'border-color:#22c55e;color:#4ade80;' : ''
             }">
               ${profile.allowGlobalFallback ? 'ON' : 'OFF'}
+            </button>
+          </div>
+          <div class="settings-row">
+            <div>
+              <span>🛡️ Profanity Filter</span>
+              <div style="font-size:0.7rem;color:#94a3b8;">Masks obvious slurs & profanity in chat</div>
+            </div>
+            <button class="icon-btn" id="set-profanity-toggle" type="button" style="min-width:60px;${
+              profile.profanityFilter ? 'border-color:#22c55e;color:#4ade80;' : ''
+            }">
+              ${profile.profanityFilter ? 'ON' : 'OFF'}
             </button>
           </div>
         </div>
@@ -647,7 +865,12 @@ function openSettingsModal(): void {
             : ''
         }
 
-        <div class="settings-footer" id="settings-secret-version">WorldMatch Chat • v1.0.0</div>
+        <div class="settings-footer">
+          <a class="more-apps-link" href="https://github.com/VaelNTN" target="_blank" rel="noopener noreferrer">
+            ✨ More Apps by VaelNTN ↗
+          </a>
+          <div id="settings-secret-version" style="margin-top:6px;">WorldMatch Chat • v1.1.0</div>
+        </div>
       </div>
     `;
 
@@ -689,6 +912,13 @@ function openSettingsModal(): void {
       session.updateProfile(profile);
       drawSettings();
       if (sessionState.phase === 'idle') renderSetup();
+    };
+
+    modal.querySelector<HTMLButtonElement>('#set-profanity-toggle')!.onclick = () => {
+      profile.profanityFilter = !profile.profanityFilter;
+      saveProfile(profile);
+      session.updateProfile(profile);
+      drawSettings();
     };
 
     modal.querySelector<HTMLButtonElement>('#set-clear-history')!.onclick = () => {
@@ -762,3 +992,6 @@ function openSettingsModal(): void {
 }
 
 render();
+if (!isAgeVerified()) {
+  openAgeGateModal();
+}

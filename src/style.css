@@ -57,7 +57,9 @@ select {
   height: 100dvh;
   overflow: hidden;
   padding-top: env(safe-area-inset-top);
+  padding-right: env(safe-area-inset-right);
   padding-bottom: env(safe-area-inset-bottom);
+  padding-left: env(safe-area-inset-left);
   background: radial-gradient(circle at top right, rgba(244, 114, 182, 0.14), transparent 45%),
     radial-gradient(circle at top left, rgba(56, 189, 248, 0.14), transparent 45%),
     var(--bg);
